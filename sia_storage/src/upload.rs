@@ -26,6 +26,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 
+mod worker;
+
 /// RAII increment of the pipeline's waiting-shard count. Held while a
 /// shard has no upload attempt in flight (encode, encrypt, or a permit
 /// wait) and dropped once it does, so the racing gate stays balanced
@@ -638,6 +640,10 @@ pub(crate) struct Upload {
     /// take permits that a primary shard is waiting for.
     waiting: watch::Sender<usize>,
     slab_tasks: VecDeque<AbortOnDropHandle<Result<Slab, UploadError>>>,
+    /// The worker pool and the request queue. The shard tasks above are the old
+    /// path and are no longer used by `read`; they are removed with the host
+    /// queue.
+    state: Arc<worker::WorkerState>,
     shard_uploaded: Option<ShardProgressCallback>,
     shard_attempt: Option<ShardAttemptCallback>,
 }
@@ -660,6 +666,21 @@ impl Upload {
         let max_buffered_slabs = options
             .max_buffered_slabs
             .unwrap_or_else(|| default_slabs_in_memory(options.slab_size()));
+        let limiter = Arc::new(UploadLimiter::new(
+            INITIAL_INFLIGHT,
+            MIN_INFLIGHT,
+            max_buffered_slabs.saturating_mul(total_shards),
+        ));
+        let state = Arc::new(worker::WorkerState::new(
+            client.clone(),
+            api_client.clone(),
+            app_key.clone(),
+            limiter.clone(),
+            total_shards,
+            max_buffered_slabs,
+            options.shard_uploaded.clone(),
+            options.shard_attempt.clone(),
+        ));
         Ok(Self {
             client,
             api_client,
@@ -670,13 +691,10 @@ impl Upload {
             )),
             erasure_coder: Arc::new(erasure_coder),
             total_shards,
-            limiter: Arc::new(UploadLimiter::new(
-                INITIAL_INFLIGHT,
-                MIN_INFLIGHT,
-                max_buffered_slabs.saturating_mul(total_shards),
-            )),
+            limiter,
             waiting: watch::channel(0).0,
             slab_tasks: VecDeque::new(),
+            state,
             shard_uploaded: options.shard_uploaded,
             shard_attempt: options.shard_attempt,
         })
@@ -840,6 +858,59 @@ impl Upload {
     /// across all [read](Self::read) calls, including bytes from reads that
     /// errored part-way. Callers can diff this across a call to recover a
     /// partial count on error and treat the bytes as dead padding.
+    /// Encodes and encrypts a filled slab, then hands its shards to the workers.
+    ///
+    /// Nothing is assigned to a host here. The schedule holds the shards, and a
+    /// connected host pulls the next one it is allowed to write, which is what
+    /// lets a host keep working across slabs instead of being spent on one.
+    async fn register_slab(&mut self, slab: ReadSlab) -> Result<(), UploadError> {
+        // Bound how many slabs hold shard memory. The slot comes back when the
+        // slab is pinned, so the ceiling is slabs in flight, not shards.
+        while !self.state.slack_available() {
+            let notified = self.state.slot_notify();
+            if self.state.slack_available() {
+                break;
+            }
+            notified.await;
+        }
+        self.state.take_slot();
+
+        let min_shards = self.erasure_coder.data_shards() as u8;
+        let length = slab.length as u32;
+        let encryption_key = slab.encryption_key.clone();
+        let rs = self.erasure_coder.clone();
+        let mut shards = slab.shards;
+        let started = Instant::now();
+        let shards = maybe_spawn_blocking!({
+            rs.encode_shards(&mut shards)?;
+            Ok::<_, UploadError>(shards)
+        })?;
+        debug!("slab encoded in {:?}", started.elapsed());
+
+        let owned_slab_key = Arc::new(encryption_key.clone());
+        let mut encrypted: Vec<Bytes> = Vec::with_capacity(shards.len());
+        for (index, mut shard) in shards.into_iter().enumerate() {
+            let key = owned_slab_key.clone();
+            let data = maybe_spawn_blocking!({
+                encrypt_shard(&key, index as u8, 0, &mut shard);
+                Bytes::from(shard)
+            });
+            encrypted.push(data);
+        }
+
+        self.state.register(
+            encrypted,
+            crate::schedule::SlabSeed {
+                encryption_key,
+                length,
+                min_shards,
+            },
+        );
+        worker::ensure_workers(&self.state);
+        self.state.notify_work();
+        Ok(())
+    }
+
     pub(crate) fn length(&self) -> u64 {
         self.slab_buffer
             .as_ref()
@@ -870,22 +941,46 @@ impl Upload {
             total_length += n as u64;
 
             if let Some(slab) = slab {
-                self.spawn_slab(slab).await?;
+                self.register_slab(slab).await?;
             }
         }
     }
 
-    /// Finalizes the pipeline, flushing any trailing partial slab and awaiting
-    /// all in-flight uploads. Returns the uploaded slabs in order.
+    /// Finalizes the pipeline, flushing any trailing partial slab, then waits
+    /// for every registered slab to be pinned by a worker.
     pub(crate) async fn finish(mut self) -> Result<Vec<Slab>, UploadError> {
         let last_slab = self.slab_buffer.take().unwrap().finish();
         if let Some(slab) = last_slab {
             self.ensure_hosts().await?;
-            self.spawn_slab(slab).await?;
+            self.register_slab(slab).await?;
         }
-        let mut slabs = Vec::with_capacity(self.slab_tasks.len());
-        while let Some(handle) = self.slab_tasks.pop_front() {
-            slabs.push(handle.await??);
+        loop {
+            let total = self.state.registered();
+            if self.state.finished() >= total {
+                break;
+            }
+            if self.state.stalled() {
+                let failure = self.state.take_failure();
+                self.state.shutdown();
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                return Err(UploadError::NotEnoughShards(0, total.min(u8::MAX as usize) as u8));
+            }
+            // Registered before the check, so a pin that lands in between is not
+            // missed.
+            let notified = self.state.done_notify();
+            if self.state.finished() >= self.state.registered() {
+                break;
+            }
+            notified.await;
+        }
+        let slabs = self.state.shutdown();
+        if slabs.len() < self.state.registered() {
+            return Err(UploadError::NotEnoughShards(
+                slabs.len().min(u8::MAX as usize) as u8,
+                self.state.registered().min(u8::MAX as usize) as u8,
+            ));
         }
         Ok(slabs)
     }
@@ -2108,6 +2203,49 @@ mod tests {
             assert_eq!(uploads.load(Ordering::SeqCst), total_shards);
             assert_eq!(api.pinned_slabs(), 0);
         }
+    }
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_upload_dials_each_host_once() {
+        // The point of the pool: one session per host, reused for every shard it
+        // is allowed to write, instead of a fresh dial for each shard of each
+        // slab. Sixty hosts, one slab, so thirty of them are used.
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::from_mock(transport.clone()));
+        hosts.update(
+            (0..60)
+                .map(|_| test_host(PrivateKey::from_seed(&rand::random()).public_key()))
+                .collect(),
+            true,
+        );
+        let api = app_client::mock::Client::new();
+        let options = UploadOptions::default();
+        let mut data = BytesMut::zeroed(options.optimal_data_size());
+        rand::rng().fill_bytes(&mut data);
+
+        let object = upload_object(
+            hosts,
+            app_client::Client::Mock(api.clone()),
+            Arc::new(AppKey::import(rand::random())),
+            Object::default(),
+            Cursor::new(data.freeze()),
+            options,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(object.slabs().len(), 1);
+        assert_eq!(api.pinned_slabs(), 1);
+        assert_eq!(
+            transport.connect_requests(),
+            transport.connected_hosts(),
+            "a host is dialled once and its session reused",
+        );
+        assert_eq!(
+            transport.connected_hosts(),
+            60,
+            "the pool fills to every candidate it can reach",
+        );
     }
 
     #[sia_core_derive::cross_target_test]

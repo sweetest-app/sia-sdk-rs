@@ -515,7 +515,10 @@ mod tests {
 
         let extra = pool.plan_extra(1);
         assert_eq!(extra.len(), 1, "one beyond the target, on request");
-        assert!(!list[..2].contains(&extra[0]), "and it is a host not in use");
+        assert!(
+            !pool.is_connected(&extra[0]),
+            "and it is a host not already in use",
+        );
     }
 
     #[test]

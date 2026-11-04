@@ -115,6 +115,21 @@ impl RequestQueue {
         self.pending.push(request);
     }
 
+    /// Whether any pending shard could be written by one of `hosts`.
+    ///
+    /// A worker that finds nothing is not evidence of a stall: it may simply have
+    /// served that slab already, while another worker has not. This is the
+    /// question that decides whether the upload is stuck.
+    pub(crate) fn servable_by(&self, hosts: &[PublicKey]) -> bool {
+        self.pending.iter().any(|request| {
+            match self.slabs.get(&request.slab) {
+                Some(slab) => hosts.iter().any(|host| !slab.has_served(host)),
+                // A request whose slab is gone is a bug, not work.
+                None => false,
+            }
+        })
+    }
+
     pub(crate) fn pending(&self) -> usize {
         self.pending.len()
     }

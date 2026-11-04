@@ -31,6 +31,11 @@ pub struct Client {
     price_requests: Arc<AtomicUsize>,
     price_failures: Arc<AtomicUsize>,
     read_requests: Arc<AtomicUsize>,
+    /// Sessions opened, so a test can check that each host is dialled once.
+    connects: Arc<AtomicUsize>,
+    /// Hosts whose session is open, so a second dial to the same host is
+    /// visible rather than silently allowed.
+    connected: Arc<RwLock<HashSet<PublicKey>>>,
 }
 
 impl Default for Client {
@@ -52,6 +57,8 @@ impl Client {
             price_requests: Arc::new(AtomicUsize::new(0)),
             price_failures: Arc::new(AtomicUsize::new(0)),
             read_requests: Arc::new(AtomicUsize::new(0)),
+            connects: Arc::new(AtomicUsize::new(0)),
+            connected: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -137,6 +144,17 @@ impl Client {
     pub fn read_requests(&self) -> usize {
         self.read_requests.load(Ordering::Relaxed)
     }
+
+    /// Number of sessions opened so far. A host dialled twice counts twice,
+    /// which is what makes a re-dial visible in a test.
+    pub fn connect_requests(&self) -> usize {
+        self.connects.load(Ordering::Relaxed)
+    }
+
+    /// How many distinct hosts have a session open.
+    pub fn connected_hosts(&self) -> usize {
+        self.connected.read().unwrap().len()
+    }
 }
 
 impl Client {
@@ -150,6 +168,8 @@ impl Client {
         if host.addresses.is_empty() {
             return Err(RHP4Error::Transport("host has no addresses".to_string()));
         }
+        self.connects.fetch_add(1, Ordering::Relaxed);
+        self.connected.write().unwrap().insert(host.public_key);
         Ok(())
     }
 

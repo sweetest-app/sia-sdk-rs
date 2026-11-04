@@ -12,4 +12,4 @@ mod queue;
 mod slab;
 
 pub(crate) use queue::{RequestQueue, ShardRequest};
-pub(crate) use slab::{SlabId, SlabTracker};
+pub(crate) use slab::{FinishedSlab, SlabId, SlabSeed, SlabTracker};

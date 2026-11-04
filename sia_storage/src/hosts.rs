@@ -211,9 +211,9 @@ impl Hosts {
             .count()
     }
 
-    /// Snapshots the currently upload-eligible host keys. Used by
-    /// [`HostQueue::new`] to seed the per-slab pool.
-    fn upload_eligible_hosts(&self) -> Vec<PublicKey> {
+    /// Snapshots the currently upload-eligible host keys. Used to seed the
+    /// worker pool, which then decides whom to dial.
+    pub(crate) fn upload_eligible_hosts(&self) -> Vec<PublicKey> {
         self.hosts
             .read()
             .unwrap()
