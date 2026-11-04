@@ -303,6 +303,13 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
 
         match result {
             Ok(root) => {
+                debug!(
+                    "[upload] {} placed shard {} of slab {} ({:.1}s)",
+                    short(&host),
+                    shard_index,
+                    request.slab.0,
+                    elapsed.as_secs_f64(),
+                );
                 if let Some(callback) = state.progress() {
                     callback(ShardProgress {
                         host_key: host,
