@@ -62,6 +62,7 @@ mod object_encryption;
 mod pool;
 pub mod preauthorized_keys;
 mod rhp4;
+mod schedule;
 mod sdk;
 mod shared_sdk;
 mod sharing;
