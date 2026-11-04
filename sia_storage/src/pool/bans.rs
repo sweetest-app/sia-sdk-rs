@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use sia_core::signing::PublicKey;
 
@@ -62,6 +63,44 @@ impl BanSet {
     }
 }
 
+/// The bans, shareable between pools.
+///
+/// Every upload in a page shares one of these, so a host that failed in one
+/// upload is not dialled again by the next. Only a reload clears it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SharedBans(Arc<Mutex<BanSet>>);
+
+impl SharedBans {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn contains(&self, host: &PublicKey) -> bool {
+        self.0.lock().unwrap().contains(host)
+    }
+
+    pub(crate) fn reason(&self, host: &PublicKey) -> Option<BanReason> {
+        self.0.lock().unwrap().reason(host)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    pub(crate) fn ban(&self, host: PublicKey, reason: BanReason) -> bool {
+        self.0.lock().unwrap().ban(host, reason)
+    }
+}
+
+/// The one ban set for this page.
+///
+/// A host that failed is never dialled again until the page reloads, whatever
+/// upload it failed in. This is the reason the pool is not per upload.
+pub(crate) fn page_bans() -> SharedBans {
+    static BANS: OnceLock<SharedBans> = OnceLock::new();
+    BANS.get_or_init(SharedBans::new).clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +134,17 @@ mod tests {
         bans.ban(key(1), BanReason::DialRefused);
         assert!(!bans.contains(&key(2)));
         assert_eq!(bans.len(), 1);
+    }
+
+    #[test]
+    fn a_shared_set_sees_a_ban_from_any_clone() {
+        let bans = SharedBans::new();
+        let other = bans.clone();
+        assert!(!other.contains(&key(1)));
+        bans.ban(key(1), BanReason::DialTimeout);
+        assert!(
+            other.contains(&key(1)),
+            "every upload shares one set, so a ban from one is a ban for the next",
+        );
     }
 }

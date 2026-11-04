@@ -96,10 +96,13 @@ impl WorkerState {
         let candidates = client.upload_eligible_hosts();
         Self {
             queue: Mutex::new(RequestQueue::new()),
-            pool: Mutex::new(HostPool::new(
+            // One ban set for the page, so a host that failed in an earlier
+            // upload is not dialled again by this one.
+            pool: Mutex::new(HostPool::with_bans(
                 HostsView(client.clone()),
                 candidates,
                 WORKER_TARGET,
+                crate::pool::page_bans(),
             )),
             limiter,
             client,

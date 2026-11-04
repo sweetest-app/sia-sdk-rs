@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use log::debug;
 use sia_core::signing::PublicKey;
 
-use super::bans::{BanReason, BanSet};
+use super::bans::{BanReason, SharedBans};
 use super::score::{dial_score, HostStats, HostView};
 
 /// Why a worker left the pool.
@@ -26,7 +26,7 @@ pub(crate) enum LeaveReason {
 pub(crate) struct HostPool<V: HostView> {
     view: V,
     candidates: Vec<PublicKey>,
-    banned: BanSet,
+    banned: SharedBans,
     connected: HashSet<PublicKey>,
     /// Candidates whose dial is in flight. Reserved so two callers cannot dial
     /// the same host, and released by `settle` or `cancel_dial`.
@@ -48,11 +48,21 @@ struct Record {
 
 impl<V: HostView> HostPool<V> {
     pub(crate) fn new(view: V, candidates: Vec<PublicKey>, target: usize) -> Self {
+        Self::with_bans(view, candidates, target, SharedBans::new())
+    }
+
+    /// A pool that shares its ban set with everything else in the page.
+    pub(crate) fn with_bans(
+        view: V,
+        candidates: Vec<PublicKey>,
+        target: usize,
+        banned: SharedBans,
+    ) -> Self {
         let candidates = candidates.into_iter().collect::<HashSet<_>>().into_iter().collect();
         Self {
             view,
             candidates,
-            banned: BanSet::default(),
+            banned: SharedBans::new(),
             connected: HashSet::new(),
             dialling: HashSet::new(),
             target,
