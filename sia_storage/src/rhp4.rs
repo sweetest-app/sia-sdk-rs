@@ -20,7 +20,7 @@ mod siamux;
 #[cfg(target_arch = "wasm32")]
 mod web_transport;
 
-mod dial_failures;
+mod dial_stats;
 
 #[cfg(any(test, feature = "mock"))]
 pub(crate) mod mock;

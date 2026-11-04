@@ -36,7 +36,7 @@ use crate::client::Metrics;
 use crate::client::metrics::TransferRate;
 use crate::time::{Duration, Instant, sleep, timeout};
 
-use super::dial_failures::DialFailures;
+use super::dial_stats::DialStats;
 use super::{Error, HostEndpoint};
 use crate::tokens::AccountTokenSource;
 
@@ -424,7 +424,7 @@ type PoolEntry = watch::Receiver<DialOutcome>;
 pub struct Client {
     pool: Rc<RefCell<HashMap<PublicKey, PoolEntry>>>,
     dial_sema: Rc<Semaphore>,
-    failures: Rc<RefCell<DialFailures>>,
+    failures: Rc<RefCell<DialStats>>,
     limits: Rc<Cell<Timeouts>>,
 }
 
@@ -456,7 +456,7 @@ impl Client {
         Client {
             pool: Rc::new(RefCell::new(HashMap::new())),
             dial_sema: Rc::new(Semaphore::new(MAX_PENDING_CONNS)),
-            failures: Rc::new(RefCell::new(DialFailures::default())),
+            failures: Rc::new(RefCell::new(DialStats::default())),
             limits: Rc::new(Cell::new(Timeouts::default())),
         }
     }
@@ -504,16 +504,10 @@ impl Client {
         // that host. Logged so the answer comes from runs, not from a guess.
         debug!("[WT] host {key} lists {} QUIC address(es)", addresses.len());
         let now = Instant::now();
-        let addresses: Vec<String> = {
-            let mut failures = self.failures.borrow_mut();
-            addresses
-                .into_iter()
-                .filter(|addr| !failures.in_backoff(addr, now))
-                .collect()
-        };
+        let _ = now;
         if addresses.is_empty() {
             return Err(Error::DialRefused(format!(
-                "every address of host {key} refused a handshake in the last five minutes"
+                "no address of host {key} accepted a handshake"
             )));
         }
 
@@ -544,20 +538,10 @@ impl Client {
             .map_err(|e| Error::Transport(format!("dial semaphore closed: {e}")))?;
         let mut last_err = None;
         for addr in addresses {
-            // Checked again here, after waiting for a dial slot, for an address
-            // listed twice or refused while this dial waited.
-            if self.failures.borrow_mut().in_backoff(addr, Instant::now()) {
-                last_err = Some(Error::DialRefused(format!(
-                    "{addr} refused a handshake in the last five minutes"
-                )));
-                continue;
-            }
             let dial_count = self.failures.borrow_mut().note_dial(addr);
             if dial_count > 1 {
                 debug!("[WT] re-dial #{dial_count} of {addr}");
             }
-            // A timeout is not recorded. Chrome can hold a healthy host back
-            // for up to a minute while it is counting earlier failures.
             let started = Instant::now();
             let result = timeout(self.timeouts().connect, connect(addr))
                 .await
@@ -572,9 +556,6 @@ impl Client {
                         "[WT] handshake {addr} failed in {:?}: {e}",
                         started.elapsed()
                     );
-                    if matches!(e, Error::DialRefused(_)) {
-                        self.failures.borrow_mut().record(addr, Instant::now());
-                    }
                     last_err = Some(e);
                 }
             }
