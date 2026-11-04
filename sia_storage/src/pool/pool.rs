@@ -115,6 +115,37 @@ impl<V: HostView> HostPool<V> {
         chosen
     }
 
+    /// Hosts to dial beyond the target.
+    ///
+    /// The target is a steady state, not a ceiling. When every connected host
+    /// has already served the slab that still has shards left, the only way to
+    /// place them is a host that has not, which means one more than the pool was
+    /// aiming for. The caller decides when that is the case, so this stays a
+    /// plain request.
+    pub(crate) fn plan_extra(&mut self, count: usize) -> Vec<PublicKey> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut ranked: Vec<(f64, PublicKey)> = self
+            .candidates
+            .iter()
+            .filter(|host| {
+                !self.banned.contains(host)
+                    && !self.connected.contains(host)
+                    && !self.dialling.contains(host)
+            })
+            .map(|host| (self.score(host), *host))
+            .collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let chosen: Vec<PublicKey> = ranked.into_iter().take(count).map(|(_, host)| host).collect();
+        for host in &chosen {
+            self.dialling.insert(*host);
+            self.attempts += 1;
+            self.per_host.entry(*host).or_default().attempts += 1;
+        }
+        chosen
+    }
+
     /// Records the outcome of a planned dial. `None` means a session opened;
     /// `Some(reason)` means the host is banned.
     ///
@@ -467,5 +498,36 @@ mod tests {
         let distinct: HashSet<_> = planned.iter().collect();
         assert_eq!(planned.len(), 6);
         assert_eq!(distinct.len(), 6);
+    }
+
+    #[test]
+    fn the_pool_can_be_pushed_past_its_target_when_a_slab_needs_a_new_host() {
+        let list = keys(4);
+        let mut pool = HostPool::new(FakeView::new(), list.clone(), 2);
+        for host in pool.plan() {
+            pool.settle(host, None);
+        }
+        assert_eq!(pool.connected(), 2);
+        assert!(
+            pool.plan().is_empty(),
+            "the target is met, so nothing is dialled",
+        );
+
+        let extra = pool.plan_extra(1);
+        assert_eq!(extra.len(), 1, "one beyond the target, on request");
+        assert!(!list[..2].contains(&extra[0]), "and it is a host not in use");
+    }
+
+    #[test]
+    fn plan_extra_stops_when_the_candidates_run_out() {
+        let list = keys(2);
+        let mut pool = HostPool::new(FakeView::new(), list.clone(), 2);
+        for host in pool.plan() {
+            pool.settle(host, None);
+        }
+        assert!(
+            pool.plan_extra(5).is_empty(),
+            "every candidate is already connected",
+        );
     }
 }

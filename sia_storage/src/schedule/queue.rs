@@ -42,12 +42,23 @@ impl RequestQueue {
         let id = SlabId(self.next_slab);
         let order = self.next_order;
         self.next_order += 1;
-        let total = shards.len();
-        self.slabs.insert(id, SlabTracker::new(id, total, order, seed));
+        self.slabs
+            .insert(id, SlabTracker::new(id, order, seed, shards.clone()));
         for (shard, data) in shards.into_iter().enumerate() {
             self.pending.push(ShardRequest { slab: id, shard, data });
         }
         id
+    }
+
+    /// Puts a slab back for another upload attempt, keeping its id and order so
+    /// the caller's bookkeeping does not move. Used when the indexer rejects a
+    /// slab as stale: the same bytes go out again rather than being re-encoded.
+    pub(crate) fn readd_slab(&mut self, id: SlabId, order: u64, shards: Vec<Bytes>, seed: SlabSeed) {
+        self.slabs
+            .insert(id, SlabTracker::new(id, order, seed, shards.clone()));
+        for (shard, data) in shards.into_iter().enumerate() {
+            self.pending.push(ShardRequest { slab: id, shard, data });
+        }
     }
 
     /// The best shard `host` may write, or `None` so the caller can park.
@@ -326,5 +337,34 @@ mod tests {
         add(&mut queue, 1);
         let line = queue.describe();
         assert!(line.contains("3 pending across 2 slabs"), "{line}");
+    }
+
+    #[test]
+    fn a_stale_slab_goes_back_with_its_own_id() {
+        let mut queue = RequestQueue::new();
+        let slab = add(&mut queue, 2);
+
+        // Place both shards so the slab finishes and is handed back.
+        let first = queue.take(&key(1)).unwrap();
+        place(&mut queue, key(1), &first);
+        let second = queue.take(&key(2)).unwrap();
+        let finished = queue
+            .placed(&key(2), &second, sector(key(2)))
+            .expect("the second shard completes it");
+        assert_eq!(finished.id, slab);
+        assert_eq!(finished.shards.len(), 2, "the bytes come back for the retry");
+
+        // The indexer rejected it as stale, so the same shards go out again and
+        // the id does not move, which keeps the caller's slot correct.
+        queue.readd_slab(finished.id, finished.order, finished.shards, finished.seed);
+        assert_eq!(queue.pending(), 2);
+        assert_eq!(queue.open_slabs(), 1);
+
+        let retry_a = queue.take(&key(3)).unwrap();
+        assert_eq!(retry_a.slab, slab);
+        place(&mut queue, key(3), &retry_a);
+        let retry_b = queue.take(&key(4)).unwrap();
+        let again = place(&mut queue, key(4), &retry_b);
+        assert_eq!(again, Some(slab), "the retry finishes under the same id");
     }
 }

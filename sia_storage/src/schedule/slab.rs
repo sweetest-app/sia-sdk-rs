@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use bytes::Bytes;
 use sia_core::signing::PublicKey;
 
 use crate::app_client::{SectorPinParams, SlabPinParams};
@@ -21,9 +22,16 @@ pub(crate) struct SlabSeed {
 }
 
 /// A slab whose every shard has landed, ready to pin.
+///
+/// It carries its shards because the indexer can reject a slab as stale, and the
+/// retry re-uploads the same bytes rather than encoding them again. The shards
+/// are reference counted, so this is pointers, not another copy of the data.
 #[derive(Debug)]
 pub(crate) struct FinishedSlab {
     pub id: SlabId,
+    pub order: u64,
+    pub seed: SlabSeed,
+    pub shards: Vec<Bytes>,
     pub pin: SlabPinParams,
 }
 
@@ -37,6 +45,9 @@ pub(crate) struct SlabTracker {
     id: SlabId,
     total: usize,
     seed: SlabSeed,
+    /// The encoded sectors, kept until the slab is pinned so a stale retry can
+    /// send the same bytes again.
+    shards: Vec<Bytes>,
     /// One entry per shard, filled as the shards land. A slot, not a counter,
     /// so a shard reported twice cannot make a slab look complete.
     sectors: Vec<Option<SectorPinParams>>,
@@ -48,11 +59,18 @@ pub(crate) struct SlabTracker {
 }
 
 impl SlabTracker {
-    pub(crate) fn new(id: SlabId, total: usize, order: u64, seed: SlabSeed) -> Self {
+    pub(crate) fn new(
+        id: SlabId,
+        order: u64,
+        seed: SlabSeed,
+        shards: Vec<Bytes>,
+    ) -> Self {
+        let total = shards.len();
         Self {
             id,
             total,
             seed,
+            shards,
             sectors: vec![None; total],
             served: HashSet::new(),
             order,
@@ -108,6 +126,9 @@ impl SlabTracker {
         let sectors: Option<Vec<SectorPinParams>> = self.sectors.into_iter().collect();
         Some(FinishedSlab {
             id: self.id,
+            order: self.order,
+            seed: self.seed.clone(),
+            shards: self.shards,
             pin: SlabPinParams {
                 version: SlabVersion::V1,
                 encryption_key: self.seed.encryption_key,
@@ -148,9 +169,13 @@ mod tests {
         }
     }
 
+    fn shards(count: usize) -> Vec<Bytes> {
+        (0..count).map(|index| Bytes::from(vec![index as u8; 8])).collect()
+    }
+
     #[test]
     fn a_slab_is_complete_only_when_every_shard_has_landed() {
-        let mut slab = SlabTracker::new(SlabId(1), 3, 0, seed());
+        let mut slab = SlabTracker::new(SlabId(1), 0, seed(), shards(3));
         assert!(slab.record(0, key(1), sector(key(1))));
         assert_eq!(slab.remaining(), 2);
         assert!(!slab.is_complete());
@@ -163,7 +188,7 @@ mod tests {
 
     #[test]
     fn a_shard_reported_twice_does_not_advance_the_slab() {
-        let mut slab = SlabTracker::new(SlabId(1), 2, 0, seed());
+        let mut slab = SlabTracker::new(SlabId(1), 0, seed(), shards(2));
         assert!(slab.record(0, key(1), sector(key(1))));
         assert!(!slab.record(0, key(2), sector(key(2))), "a duplicate is not progress");
         assert_eq!(slab.placed(), 1);
@@ -171,14 +196,14 @@ mod tests {
 
     #[test]
     fn a_shard_index_outside_the_slab_is_refused() {
-        let mut slab = SlabTracker::new(SlabId(1), 2, 0, seed());
+        let mut slab = SlabTracker::new(SlabId(1), 0, seed(), shards(2));
         assert!(!slab.record(2, key(1), sector(key(1))));
         assert_eq!(slab.placed(), 0);
     }
 
     #[test]
     fn a_host_that_placed_a_shard_is_recorded_as_served() {
-        let mut slab = SlabTracker::new(SlabId(1), 2, 0, seed());
+        let mut slab = SlabTracker::new(SlabId(1), 0, seed(), shards(2));
         assert!(!slab.has_served(&key(1)));
         slab.record(0, key(1), sector(key(1)));
         assert!(slab.has_served(&key(1)));
@@ -187,11 +212,12 @@ mod tests {
 
     #[test]
     fn finishing_carries_every_sector_and_the_slab_header() {
-        let mut slab = SlabTracker::new(SlabId(9), 2, 0, seed());
+        let mut slab = SlabTracker::new(SlabId(9), 0, seed(), shards(2));
         slab.record(1, key(2), sector(key(2)));
         slab.record(0, key(1), sector(key(1)));
         let finished = slab.finish().expect("every shard is in");
         assert_eq!(finished.id, SlabId(9));
+        assert_eq!(finished.shards.len(), 2, "the shards come back for a retry");
         assert_eq!(finished.pin.min_shards, 10);
         assert_eq!(finished.pin.sectors.len(), 2);
         assert_eq!(finished.pin.sectors[0].sector.host_key, key(1));
