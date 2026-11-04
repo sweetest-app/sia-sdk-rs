@@ -285,10 +285,18 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
         let slab_index = (request.slab.0 as usize).saturating_sub(1);
         let shard_index = request.shard;
         let data = request.data.clone();
+        // The congestion controller only learns from completions it was told
+        // about, so every write hands one back.
+        let sample = state.limiter.sample();
         let result = state
             .client
             .write_sector(host, &state.app_key.0, data, RPC_IDLE_TIMEOUT)
             .await;
+        let elapsed = started.elapsed();
+        if matches!(&result, Err(RPCError::Rhp(inner)) if inner.is_timeout()) {
+            state.limiter.record_timeout(sample, host);
+        }
+        state.limiter.record(sample, elapsed, result.is_ok());
 
         match result {
             Ok(root) => {
