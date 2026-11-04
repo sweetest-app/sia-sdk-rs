@@ -843,14 +843,16 @@ mod tests {
         );
     }
 
-    /// A worker cannot hold a shard it has no permit to send.
+    /// The write gate refuses a worker past the limit, and admits it as soon as
+    /// one frees up.
     ///
-    /// The worker loop takes the permit before it asks the queue for work, so
-    /// memory is bounded by the write gate rather than by how many hosts happen
-    /// to be connected. This checks the gate really refuses the next worker
-    /// while the limit is reached.
+    /// The worker loop asks for this permit before it asks the queue for a
+    /// shard, so memory is bounded by the write gate rather than by how many
+    /// hosts are connected. The ordering itself is one line in `run_worker` and
+    /// is not observable from a test; what is observable, and checked here, is
+    /// that the gate really holds a worker out.
     #[sia_core_derive::cross_target_test]
-    async fn test_a_worker_cannot_hold_a_shard_without_a_permit() {
+    async fn test_the_write_gate_refuses_a_worker_past_the_limit() {
         use std::task::{Context, Poll, Waker};
 
         // `UploadLimiter::new` starts at the initial inflight, which is 8, so
