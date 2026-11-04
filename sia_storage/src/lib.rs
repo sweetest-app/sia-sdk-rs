@@ -59,6 +59,7 @@ mod encryption;
 mod erasure_coding;
 mod hosts;
 mod object_encryption;
+mod pool;
 pub mod preauthorized_keys;
 mod rhp4;
 mod sdk;

@@ -1,0 +1,99 @@
+use std::collections::HashMap;
+
+use sia_core::signing::PublicKey;
+
+/// Why a host was banned. Kept for the one log line that explains it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BanReason {
+    /// The connect budget ran out before the session opened.
+    DialTimeout,
+    /// The browser or the host refused the handshake.
+    DialRefused,
+    /// The host took the session and then failed to store a shard.
+    WriteFailed,
+    /// The shard was accepted but the transfer ran past its cap.
+    TransferTimeout,
+}
+
+impl BanReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DialTimeout => "connect timeout",
+            Self::DialRefused => "handshake refused",
+            Self::WriteFailed => "write failed",
+            Self::TransferTimeout => "transfer timeout",
+        }
+    }
+}
+
+/// Hosts that failed once, for the life of the page.
+///
+/// There is no cooldown, no ladder and no retry. A host that failed is never
+/// dialled again until the page reloads, which keeps the rule small enough to
+/// reason about and stops a bad pool from being walked twice.
+#[derive(Debug, Default)]
+pub(crate) struct BanSet {
+    hosts: HashMap<PublicKey, BanReason>,
+}
+
+impl BanSet {
+    /// Bans a host. Returns false when it was already banned. The first reason is
+    /// kept, because it is the one that explains the failure.
+    pub(crate) fn ban(&mut self, host: PublicKey, reason: BanReason) -> bool {
+        match self.hosts.entry(host) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(reason);
+                true
+            }
+        }
+    }
+
+    pub(crate) fn contains(&self, host: &PublicKey) -> bool {
+        self.hosts.contains_key(host)
+    }
+
+    pub(crate) fn reason(&self, host: &PublicKey) -> Option<BanReason> {
+        self.hosts.get(host).copied()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.hosts.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sia_core::signing::PrivateKey;
+
+    fn key(seed: u8) -> PublicKey {
+        PrivateKey::from_seed(&[seed; 32]).public_key()
+    }
+
+    #[test]
+    fn a_banned_host_stays_banned_and_keeps_its_reason() {
+        let mut bans = BanSet::default();
+        assert!(!bans.contains(&key(1)));
+
+        assert!(bans.ban(key(1), BanReason::DialTimeout), "first ban is new");
+        assert!(bans.contains(&key(1)));
+        assert_eq!(bans.reason(&key(1)), Some(BanReason::DialTimeout));
+
+        assert!(!bans.ban(key(1), BanReason::WriteFailed), "already banned");
+        assert_eq!(
+            bans.reason(&key(1)),
+            Some(BanReason::DialTimeout),
+            "the first reason is the one worth logging",
+        );
+        assert_eq!(bans.len(), 1);
+    }
+
+    #[test]
+    fn banning_one_host_does_not_ban_another() {
+        let mut bans = BanSet::default();
+        bans.ban(key(1), BanReason::DialRefused);
+        assert!(!bans.contains(&key(2)));
+        assert_eq!(bans.len(), 1);
+    }
+}
