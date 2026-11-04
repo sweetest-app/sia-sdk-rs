@@ -302,6 +302,19 @@ impl Client {
         outcome.as_ref().expect("waited for an outcome").clone()
     }
 
+    /// Opens a session to a host without running an RPC. A dial that fails is
+    /// recorded against the host, so the score sees an unreachable host as well
+    /// as one whose writes fail.
+    pub(crate) async fn connect(
+        &self,
+        host: &HostEndpoint,
+        idle_timeout: Duration,
+    ) -> Result<(), Error> {
+        let result = self.transport.connect(host, idle_timeout).await;
+        self.metrics
+            .record_result(host.public_key, result.map(|_| ()))
+    }
+
     pub(crate) async fn write_sector(
         &self,
         host: &HostEndpoint,

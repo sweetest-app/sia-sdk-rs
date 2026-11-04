@@ -622,6 +622,16 @@ impl Client {
 // in self.leftover and serves to subsequent poll_read calls without further
 // JS calls.
 impl Client {
+    /// Opens the session and keeps it in the pool, so the shards that follow
+    /// pay no handshake.
+    pub(crate) async fn connect(
+        &self,
+        host: &HostEndpoint,
+        _idle_timeout: Duration,
+    ) -> Result<(), Error> {
+        self.connection(host).await.map(|_| ())
+    }
+
     pub(crate) async fn host_prices(
         &self,
         host: &HostEndpoint,

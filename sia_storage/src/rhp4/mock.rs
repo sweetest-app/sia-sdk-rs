@@ -140,6 +140,19 @@ impl Client {
 }
 
 impl Client {
+    /// The mock has no session to open, so it only reports whether the host is
+    /// reachable at all, which is what the pool needs to test against.
+    pub(crate) async fn connect(
+        &self,
+        host: &HostEndpoint,
+        _idle_timeout: Duration,
+    ) -> Result<(), RHP4Error> {
+        if host.addresses.is_empty() {
+            return Err(RHP4Error::Transport("host has no addresses".to_string()));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn host_prices(
         &self,
         _: &HostEndpoint,

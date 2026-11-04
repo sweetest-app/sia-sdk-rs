@@ -117,6 +117,27 @@ impl Client {
         }
     }
 
+    /// Opens a session to a host without running an RPC.
+    ///
+    /// The pool dials a candidate once and keeps the session for every shard
+    /// that follows, so this is the handshake on its own. A transport that
+    /// cannot hold a session open reports success and dials again on the next
+    /// RPC.
+    pub(crate) async fn connect(
+        &self,
+        host: &HostEndpoint,
+        idle_timeout: Duration,
+    ) -> Result<(), Error> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::SiaMux(c) => c.connect(host, idle_timeout).await,
+            #[cfg(target_arch = "wasm32")]
+            Self::WebTransport(c) => c.connect(host, idle_timeout).await,
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(c) => c.connect(host, idle_timeout).await,
+        }
+    }
+
     pub(crate) async fn write_sector(
         &self,
         host: &HostEndpoint,

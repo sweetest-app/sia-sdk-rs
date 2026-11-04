@@ -193,6 +193,17 @@ impl Client {
 }
 
 impl Client {
+    /// Opens a connection and opens one stream on it, which is as close as this
+    /// transport gets to a handshake on its own. The connection is kept in the
+    /// pool, so later RPCs to the same host reuse it.
+    pub(crate) async fn connect(
+        &self,
+        host: &HostEndpoint,
+        _idle_timeout: Duration,
+    ) -> Result<(), TransportError> {
+        self.host_stream(host).await.map(|_| ())
+    }
+
     pub(crate) async fn host_prices(
         &self,
         host: &HostEndpoint,

@@ -310,6 +310,18 @@ impl Hosts {
         }
     }
 
+    /// Opens a session to a host without running an RPC, so the worker pool can
+    /// dial a candidate once and reuse it for every shard that follows.
+    pub(crate) async fn connect(
+        &self,
+        host_key: PublicKey,
+        idle_timeout: Duration,
+    ) -> Result<(), RPCError> {
+        let host = self.host_endpoint(host_key)?;
+        self.transport.connect(&host, idle_timeout).await?;
+        Ok(())
+    }
+
     /// Creates a per-slab [`HostQueue`] from the currently
     /// upload-eligible hosts. Each host is handed out once until retried.
     /// Pass the slab's shard count as `pending_initial` so each shard has

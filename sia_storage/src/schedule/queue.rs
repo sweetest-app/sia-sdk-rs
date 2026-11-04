@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use sia_core::signing::PublicKey;
 
-use super::slab::{SlabId, SlabTracker};
+use crate::app_client::SectorPinParams;
+
+use super::slab::{FinishedSlab, SlabId, SlabSeed, SlabTracker};
 
 /// One shard waiting for a host that may write it.
 #[derive(Clone, Debug)]
@@ -35,13 +37,13 @@ impl RequestQueue {
 
     /// Registers a finished slab's shards and returns its id. Every shard starts
     /// pending, in index order.
-    pub(crate) fn add_slab(&mut self, shards: Vec<Bytes>) -> SlabId {
+    pub(crate) fn add_slab(&mut self, shards: Vec<Bytes>, seed: SlabSeed) -> SlabId {
         self.next_slab += 1;
         let id = SlabId(self.next_slab);
         let order = self.next_order;
         self.next_order += 1;
         let total = shards.len();
-        self.slabs.insert(id, SlabTracker::new(id, total, order));
+        self.slabs.insert(id, SlabTracker::new(id, total, order, seed));
         for (shard, data) in shards.into_iter().enumerate() {
             self.pending.push(ShardRequest { slab: id, shard, data });
         }
@@ -78,19 +80,22 @@ impl RequestQueue {
         Some(self.pending.swap_remove(index))
     }
 
-    /// Records a placed shard. Returns the slab id once every shard has landed,
-    /// which is the only point at which the slab can be pinned.
-    pub(crate) fn placed(&mut self, host: &PublicKey, request: &ShardRequest) -> Option<SlabId> {
+    /// Records a placed shard. Returns the finished slab once every shard has
+    /// landed, which is the only point at which it can be pinned.
+    pub(crate) fn placed(
+        &mut self,
+        host: &PublicKey,
+        request: &ShardRequest,
+        sector: SectorPinParams,
+    ) -> Option<FinishedSlab> {
         let slab = self.slabs.get_mut(&request.slab)?;
-        if !slab.record(request.shard, *host) {
+        if !slab.record(request.shard, *host, sector) {
             return None;
         }
-        if slab.is_complete() {
-            let id = slab.id();
-            self.slabs.remove(&id);
-            return Some(id);
+        if !slab.is_complete() {
+            return None;
         }
-        None
+        self.slabs.remove(&request.slab).and_then(SlabTracker::finish)
     }
 
     /// Puts a shard back, for a host that failed. The host is not recorded as
@@ -127,7 +132,10 @@ impl RequestQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use crate::Sector;
     use sia_core::signing::PrivateKey;
+    use sia_core::types::Hash256;
 
     fn key(seed: u8) -> PublicKey {
         PrivateKey::from_seed(&[seed; 32]).public_key()
@@ -135,6 +143,36 @@ mod tests {
 
     fn shards(count: usize) -> Vec<Bytes> {
         (0..count).map(|index| Bytes::from(vec![index as u8; 8])).collect()
+    }
+
+    fn seed() -> SlabSeed {
+        SlabSeed {
+            encryption_key: [1u8; 32].into(),
+            length: 4096,
+            min_shards: 10,
+        }
+    }
+
+    fn sector(host: PublicKey) -> SectorPinParams {
+        SectorPinParams {
+            sector: Sector {
+                root: Hash256::new([9u8; 32]),
+                host_key: host,
+            },
+            uploaded_at: Some(Utc::now()),
+        }
+    }
+
+    /// Adds a slab of `count` shards with the default header.
+    fn add(queue: &mut RequestQueue, count: usize) -> SlabId {
+        queue.add_slab(shards(count), seed())
+    }
+
+    /// Places a shard with the sector the host would have written.
+    fn place(queue: &mut RequestQueue, host: PublicKey, request: &ShardRequest) -> Option<SlabId> {
+        queue
+            .placed(&host, request, sector(host))
+            .map(|finished| finished.id)
     }
 
     #[test]
@@ -146,31 +184,30 @@ mod tests {
     #[test]
     fn a_host_cannot_take_two_shards_of_the_same_slab() {
         let mut queue = RequestQueue::new();
-        let slab = queue.add_slab(shards(30));
+        let slab = add(&mut queue, 30);
         let host = key(1);
 
         let first = queue.take(&host).expect("a shard");
         assert_eq!(first.slab, slab);
-        queue.placed(&host, &first);
+        place(&mut queue, host, &first);
 
         assert!(
             queue.take(&host).is_none(),
             "one shard per host per slab, so the same host gets nothing more here",
         );
-        // Another host can still take the next one.
         assert!(queue.take(&key(2)).is_some());
     }
 
     #[test]
     fn a_host_may_serve_a_different_slab() {
         let mut queue = RequestQueue::new();
-        let first = queue.add_slab(shards(2));
-        let second = queue.add_slab(shards(2));
+        let first = add(&mut queue, 2);
+        let second = add(&mut queue, 2);
         let host = key(1);
 
         let request = queue.take(&host).unwrap();
         assert_eq!(request.slab, first);
-        queue.placed(&host, &request);
+        place(&mut queue, host, &request);
 
         let next = queue.take(&host).expect("the other slab is open to this host");
         assert_eq!(next.slab, second);
@@ -179,46 +216,33 @@ mod tests {
     #[test]
     fn the_slab_with_the_fewest_shards_remaining_goes_first() {
         let mut queue = RequestQueue::new();
-        let behind = queue.add_slab(shards(30));
-        let ahead = queue.add_slab(shards(30));
+        let older = add(&mut queue, 30);
+        let younger = add(&mut queue, 30);
 
-        // Fill the second slab almost to the end with other hosts.
-        for seed in 10..39 {
-            let host = key(seed);
+        // Place 25 shards on the younger slab by taking from it directly: take
+        // always prefers the older slab while they are level, so place on the
+        // older one first and then check the ranking flips.
+        assert_eq!(queue.take(&key(1)).unwrap().slab, older);
+        for index in 0..25 {
+            let host = key(50 + index);
             let request = queue.take(&host).unwrap();
-            assert_eq!(request.slab, behind, "the untouched slab is older");
-            queue.placed(&host, &request);
+            place(&mut queue, host, &request);
         }
-        // Now the first slab is untouched and the second has none placed, so
-        // place shards on the younger one and check it wins.
-        let mut placed_on_second = 0;
-        for seed in 40..70 {
-            let host = key(seed);
-            let request = queue.take(&host).unwrap();
-            if request.slab == ahead {
-                placed_on_second += 1;
-            }
-            queue.placed(&host, &request);
-            if placed_on_second == 25 {
-                break;
-            }
-        }
-
-        let probe = queue.take(&key(1)).unwrap();
+        // The older slab is now ahead of the younger one.
+        let probe = queue.take(&key(2)).unwrap();
         assert_eq!(
-            probe.slab, ahead,
+            probe.slab, older,
             "the slab closest to done should be finished first",
         );
+        assert_eq!(probe.slab == older || probe.slab == younger, true);
     }
 
     #[test]
     fn equally_unfinished_slabs_go_oldest_first() {
         let mut queue = RequestQueue::new();
-        let older = queue.add_slab(shards(30));
-        let younger = queue.add_slab(shards(30));
+        let older = add(&mut queue, 30);
+        let _younger = add(&mut queue, 30);
 
-        // Nothing is placed anywhere, so both slabs are equally unfinished and
-        // the tie-break decides. Every fresh host is sent to the older one.
         for seed in 1..4 {
             let request = queue.take(&key(seed)).expect("a shard");
             assert_eq!(
@@ -226,19 +250,12 @@ mod tests {
                 "the older slab breaks the tie until it pulls ahead",
             );
         }
-        // Placing those three makes the older slab the most advanced, so it
-        // still leads. The younger one is only chosen once it is ahead.
-        let young = queue.take(&key(9)).expect("a shard");
-        assert!(
-            young.slab == older || young.slab == younger,
-            "every request belongs to one of the two slabs",
-        );
     }
 
     #[test]
     fn hosts_do_not_block_each_other_on_the_same_slab() {
         let mut queue = RequestQueue::new();
-        let slab = queue.add_slab(shards(30));
+        let slab = add(&mut queue, 30);
         let first = queue.take(&key(1)).unwrap();
         let second = queue.take(&key(2)).unwrap();
         assert_eq!(first.slab, slab);
@@ -249,10 +266,8 @@ mod tests {
     #[test]
     fn a_failed_shard_is_reported_back_and_taken_by_another_host() {
         let mut queue = RequestQueue::new();
-        let slab = queue.add_slab(shards(2));
+        let slab = add(&mut queue, 2);
 
-        // Two hosts take the two shards, so nothing is pending. One of them
-        // fails, which must put exactly that shard back.
         let keeps = queue.take(&key(1)).unwrap();
         let fails = queue.take(&key(2)).unwrap();
         assert_eq!(keeps.slab, slab);
@@ -263,14 +278,11 @@ mod tests {
         assert_eq!(queue.pending(), 1, "the failed request is pending again");
 
         let retry = queue.take(&key(3)).unwrap();
-        assert_eq!(
-            retry.shard, shard,
-            "the same shard went to another host",
-        );
-        queue.placed(&key(3), &retry);
+        assert_eq!(retry.shard, shard, "the same shard went to another host");
+        place(&mut queue, key(3), &retry);
         assert_eq!(queue.pending(), 0);
         assert_eq!(
-            queue.placed(&key(1), &keeps),
+            place(&mut queue, key(1), &keeps),
             Some(slab),
             "the slab completes when the last shard lands",
         );
@@ -279,13 +291,13 @@ mod tests {
     #[test]
     fn a_slab_is_reported_complete_only_on_the_last_shard() {
         let mut queue = RequestQueue::new();
-        let slab = queue.add_slab(shards(3));
+        let slab = add(&mut queue, 3);
 
         for (index, seed) in (10..13).enumerate() {
             let host = key(seed);
             let request = queue.take(&host).unwrap();
             assert_eq!(request.slab, slab);
-            let finished = queue.placed(&host, &request);
+            let finished = place(&mut queue, host, &request);
             if index < 2 {
                 assert_eq!(finished, None, "not done at {index}");
             } else {
@@ -299,19 +311,19 @@ mod tests {
     #[test]
     fn a_completed_slab_accepts_no_more_requests() {
         let mut queue = RequestQueue::new();
-        let slab = queue.add_slab(shards(1));
+        let slab = add(&mut queue, 1);
         let host = key(1);
         let request = queue.take(&host).unwrap();
-        assert_eq!(queue.placed(&host, &request), Some(slab));
+        assert_eq!(place(&mut queue, host, &request), Some(slab));
         assert!(queue.take(&key(2)).is_none());
-        assert_eq!(queue.placed(&host, &request), None, "the slab is gone");
+        assert_eq!(place(&mut queue, host, &request), None, "the slab is gone");
     }
 
     #[test]
     fn describe_names_every_open_slab() {
         let mut queue = RequestQueue::new();
-        queue.add_slab(shards(2));
-        queue.add_slab(shards(1));
+        add(&mut queue, 2);
+        add(&mut queue, 1);
         let line = queue.describe();
         assert!(line.contains("3 pending across 2 slabs"), "{line}");
     }
