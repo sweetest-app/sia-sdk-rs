@@ -242,25 +242,41 @@ mod tests {
     #[test]
     fn the_slab_with_the_fewest_shards_remaining_goes_first() {
         let mut queue = RequestQueue::new();
+        // 30 shards to place, 29 of them on the older slab, so the older slab
+        // is one shard from done while the younger one is untouched.
         let older = add(&mut queue, 30);
         let younger = add(&mut queue, 30);
-
-        // Place 25 shards on the younger slab by taking from it directly: take
-        // always prefers the older slab while they are level, so place on the
-        // older one first and then check the ranking flips.
-        assert_eq!(queue.take(&key(1)).unwrap().slab, older);
-        for index in 0..25 {
+        for index in 0..29 {
             let host = key(50 + index);
             let request = queue.take(&host).unwrap();
+            assert_eq!(request.slab, older, "the unfinished slab is the one to work on");
             place(&mut queue, host, &request);
         }
-        // The older slab is now ahead of the younger one.
-        let probe = queue.take(&key(2)).unwrap();
+
+        // One shard left on the older slab, thirty on the younger. The older
+        // is chosen for the reason the rule gives: the fewest shards left.
+        let last = queue.take(&key(99)).unwrap();
         assert_eq!(
-            probe.slab, older,
-            "the slab closest to done should be finished first",
+            last.slab, older,
+            "a slab one shard from done is finished before a bigger one starts",
         );
-        assert_eq!(probe.slab == older || probe.slab == younger, true);
+        assert!(place(&mut queue, key(99), &last).is_some(), "that shard finishes it");
+
+        let next = queue.take(&key(98)).unwrap();
+        assert_eq!(next.slab, younger, "the younger slab is what is left");
+    }
+
+    #[test]
+    fn a_small_slab_is_finished_before_an_older_big_one() {
+        // Age only breaks a tie. The younger slab here is far closer to done,
+        // so it wins even though the other one was added first. Getting this
+        // backwards would leave partial slabs, which are never pinned.
+        let mut queue = RequestQueue::new();
+        let _older = add(&mut queue, 30);
+        let younger = add(&mut queue, 2);
+
+        let first = queue.take(&key(1)).unwrap();
+        assert_eq!(first.slab, younger, "two shards left beats thirty");
     }
 
     #[test]

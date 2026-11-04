@@ -24,7 +24,6 @@ use log::debug;
 use sia_core::signing::PublicKey;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::Notify;
 use tokio::sync::oneshot;
 
 mod worker;
