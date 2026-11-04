@@ -320,6 +320,14 @@ impl Hosts {
         Ok(())
     }
 
+    /// Whether a session to this host is still open in the transport pool.
+    ///
+    /// A host that hung up on an idle session is not a failure, so the worker
+    /// asks this before blaming the host for a write that could not start.
+    pub(crate) fn is_connected(&self, host_key: &PublicKey) -> bool {
+        self.transport.is_connected(host_key)
+    }
+
     pub fn write_estimate(&self, bytes: u32) -> Duration {
         self.transport.write_estimate(bytes)
     }

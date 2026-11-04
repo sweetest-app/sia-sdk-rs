@@ -86,11 +86,16 @@ impl Client {
 /// There is no bound on the total RPC duration, so a slow transfer that keeps
 /// moving bytes is allowed to finish.
 impl Client {
+    /// Whether a session to this host is still open.
+    ///
+    /// Only the browser transport pools sessions, so only it can answer. The
+    /// others say true, which keeps a failed write a failure of the host rather
+    /// than a session that was never tracked.
     pub(crate) fn is_connected(&self, host_key: &PublicKey) -> bool {
         match self {
             #[cfg(target_arch = "wasm32")]
             Self::WebTransport(c) => c.is_connected(host_key),
-            _ => false,
+            _ => true,
         }
     }
 

@@ -310,6 +310,19 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
             }
             Err(error) => {
                 drop(permit);
+                // A host that hung up on an idle session did nothing wrong, so
+                // it goes back among the candidates instead of being banned.
+                if !state.client.is_connected(&host) {
+                    debug!(
+                        "[pool] {} closed its session, back to the candidates",
+                        short(&host)
+                    );
+                    state.pool.lock().unwrap().leave(host, LeaveReason::Closed);
+                    state.queue.lock().unwrap().failed(request);
+                    state.work.notify_waiters();
+                    ensure_workers(&state);
+                    return;
+                }
                 let reason = write_reason(&error);
                 if let Some(callback) = state.attempt() {
                     callback(ShardAttemptInfo {
