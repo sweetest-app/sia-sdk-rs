@@ -242,6 +242,13 @@ impl HostScore {
     pub(crate) fn weighted_throughput(&self) -> Option<TransferRate> {
         self.throughput.map(|t| t / (self.inflight as f64 + 1.0))
     }
+
+    /// Whether this host has never completed a transfer, so there is nothing to
+    /// judge it by beyond the absence of failures. The host queue spends a fixed
+    /// slice of each slab on these and fills the rest from hosts it has seen.
+    pub(crate) fn is_unsampled(&self) -> bool {
+        self.throughput.is_none()
+    }
 }
 
 impl PartialEq for HostScore {

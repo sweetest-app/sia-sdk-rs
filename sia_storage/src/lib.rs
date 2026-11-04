@@ -116,6 +116,12 @@ pub type AppID = Hash256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
     /// Opening a WebTransport session to one address.
+    ///
+    /// Ten seconds. An idle link opens a session in about 1.7 seconds, so six
+    /// was enough on its own, but a link already carrying a slab makes the same
+    /// handshake take eight or nine and six then failed hosts that would have
+    /// worked. The cap still costs about a third less than the original fifteen
+    /// per silent host, which is what makes host discovery affordable.
     pub connect: Duration,
     /// One RPC, from stream open to the last byte.
     pub transfer: Duration,
@@ -124,7 +130,7 @@ pub struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
-            connect: Duration::from_secs(15),
+            connect: Duration::from_secs(10),
             transfer: Duration::from_secs(30),
         }
     }
@@ -1827,5 +1833,15 @@ mod test {
                 slab_idx
             );
         }
+    }
+
+    /// The browser upload was measured against these numbers. Idle handshakes
+    /// land in about 1.7s, but the same handshake takes eight or nine seconds
+    /// while a slab is uploading, so the cap has to clear the loaded case.
+    #[test]
+    fn the_default_connect_cap_is_ten_seconds() {
+        let timeouts = Timeouts::default();
+        assert_eq!(timeouts.connect, Duration::from_secs(10));
+        assert_eq!(timeouts.transfer, Duration::from_secs(30));
     }
 }

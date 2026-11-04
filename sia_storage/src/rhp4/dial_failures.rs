@@ -12,9 +12,20 @@ pub(crate) const DIAL_FAILURE_BACKOFF: Duration = Duration::from_secs(5 * 60);
 #[derive(Debug, Default)]
 pub(crate) struct DialFailures {
     refused_at: HashMap<String, Instant>,
+    /// How many times each address has been dialed. Two or more means the pool
+    /// came back to an address it had already spent a connect budget on, which
+    /// is the only case a bench on a timeout would pay for.
+    dials: HashMap<String, usize>,
 }
 
 impl DialFailures {
+    /// Counts a dial of `address` and returns how many times it has been dialed,
+    /// this one included.
+    pub(crate) fn note_dial(&mut self, address: &str) -> usize {
+        let count = self.dials.entry(address.to_string()).or_default();
+        *count += 1;
+        *count
+    }
     /// Also forgets every record whose backoff is over, so addresses that are
     /// never dialed again do not stay for the life of the page.
     pub(crate) fn record(&mut self, address: &str, now: Instant) {
@@ -89,5 +100,15 @@ mod tests {
         failures.record("a:9984", second);
 
         assert!(failures.in_backoff("a:9984", second + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn dials_are_counted_per_address() {
+        let mut failures = DialFailures::default();
+
+        assert_eq!(failures.note_dial("a:9984"), 1);
+        assert_eq!(failures.note_dial("a:9984"), 2);
+        assert_eq!(failures.note_dial("b:9984"), 1);
+        assert_eq!(failures.note_dial("a:9984"), 3);
     }
 }

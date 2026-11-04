@@ -55,7 +55,15 @@ extern "C" {
 const RHP4_PATH: &str = "/sia/rhp/v4";
 
 /// Maximum concurrent in-flight dials.
-const MAX_PENDING_CONNS: usize = 4;
+///
+/// A slab needs 30 sessions from 30 different hosts, so this is the ceiling on
+/// how fast hosts are discovered. Four was too few: a host that times out held a
+/// quarter of the capacity for the whole connect budget. Sixteen was too many:
+/// alongside sixteen concurrent shard writes on a saturated uplink it turned a
+/// healthy upload into 216 consecutive connect timeouts for two placed shards.
+/// Eight is double the old ceiling without adding enough load to starve the
+/// handshakes it is supposed to serve.
+const MAX_PENDING_CONNS: usize = 8;
 
 /// Timeout for opening a bidirectional stream on an established connection.
 /// The RPC's idle clock only starts once the stream is open, so a hung
@@ -491,6 +499,10 @@ impl Client {
                 "no QUIC/WebTransport address for host {key}"
             )));
         }
+        // How many addresses a host lists decides what a timeout bench would be
+        // worth: with two or more, a dead first address is paid on every dial of
+        // that host. Logged so the answer comes from runs, not from a guess.
+        debug!("[WT] host {key} lists {} QUIC address(es)", addresses.len());
         let now = Instant::now();
         let addresses: Vec<String> = {
             let mut failures = self.failures.borrow_mut();
@@ -539,6 +551,10 @@ impl Client {
                     "{addr} refused a handshake in the last five minutes"
                 )));
                 continue;
+            }
+            let dial_count = self.failures.borrow_mut().note_dial(addr);
+            if dial_count > 1 {
+                debug!("[WT] re-dial #{dial_count} of {addr}");
             }
             // A timeout is not recorded. Chrome can hold a healthy host back
             // for up to a minute while it is counting earlier failures.

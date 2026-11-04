@@ -458,6 +458,27 @@ pub enum QueueError {
 /// with a transient failure instead of sidelining it on the first error.
 const MAX_HOST_ATTEMPTS: usize = 3;
 
+/// Which hosts a pick may draw from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Group {
+    /// No filter, which is the ordering [`HostScore`] already describes.
+    Any,
+    /// Hosts nobody has transferred to yet.
+    Untried,
+    /// Hosts that have served a shard before.
+    Tried,
+}
+
+impl Group {
+    fn accepts(self, unsampled: bool) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Untried => unsampled,
+            Self::Tried => !unsampled,
+        }
+    }
+}
+
 /// Per-slab pool of upload hosts. Snapshots upload-eligible hosts at
 /// construction and hands them out one at a time. Failed hosts go back
 /// via [`HostQueue::retry`], capped at [`MAX_HOST_ATTEMPTS`] failures per
@@ -466,6 +487,11 @@ const MAX_HOST_ATTEMPTS: usize = 3;
 /// Holds one host in reserve per shard that has not started yet.
 /// [`HostQueue::pick_initial`] draws from the reserve; [`HostQueue::pick`]
 /// only takes the surplus, so every shard gets a host for its first attempt.
+///
+/// A shard's first host is usually one that has served a shard before: reusing
+/// a known host is cheaper than paying a connect timeout on a new one. A third
+/// of the slab is still spent on hosts nobody has tried, so a better host can
+/// still be found, and a slab with nothing proven falls back to all discovery.
 ///
 /// `available` is a snapshot, not a live view of [`Hosts`]: hosts
 /// removed via [`Hosts::update`] after construction stay in the pool but
@@ -480,15 +506,56 @@ pub(crate) struct HostQueue {
     /// Shards still waiting on their first host. [`HostQueue::pick`] leaves
     /// this many hosts untouched.
     pending_initial: usize,
+    /// Untried hosts this slab may still spend on discovery.
+    explore_left: usize,
 }
 
 impl HostQueue {
     fn new(hosts: Hosts, available: Vec<PublicKey>, pending_initial: usize) -> Self {
+        // A host that has already moved a shard costs nothing to use again: the
+        // session is pooled, so picking it back up needs no handshake. So the
+        // only reason to spend a pick on a host nobody has tried is that there
+        // are not enough proven hosts to fill the slab. One is always kept while
+        // untried hosts remain, so a pool that has gone bad is still noticed and
+        // a better host can still be found.
+        let proven = {
+            let host_info = hosts.hosts.read().unwrap();
+            available
+                .iter()
+                .filter(|hk| {
+                    host_info.get(hk).is_some_and(|info| {
+                        let score = hosts
+                            .transport
+                            .host_score(hk, info.inflight_uploads.load(Ordering::Relaxed));
+                        !score.is_unsampled()
+                    })
+                })
+                .count()
+        };
+        let untried = available.len().saturating_sub(proven);
+        let explore_left = if untried == 0 {
+            0
+        } else {
+            // Never more than three in ten, never more than the shortfall, and
+            // never none while an untried host is left.
+            pending_initial
+                .saturating_sub(proven)
+                .max(1)
+                .min(pending_initial.saturating_mul(3).div_ceil(10).max(1))
+        };
+        debug!(
+            "host queue: {} shards, {} proven of {} eligible hosts, {} untried picks reserved",
+            pending_initial,
+            proven,
+            available.len(),
+            explore_left,
+        );
         Self {
             hosts,
             available,
             attempts: HashMap::new(),
             pending_initial,
+            explore_left,
         }
     }
 
@@ -497,6 +564,13 @@ impl HostQueue {
     /// then weighted throughput. The winner leaves `available`; hold the
     /// returned [`InflightGuard`] for the RPC so concurrent picks see the load.
     pub(crate) fn pick(&mut self) -> Option<(PublicKey, InflightGuard)> {
+        self.pick_group(Group::Any)
+    }
+
+    /// Picks the best host from one group: hosts nobody has tried, or hosts that
+    /// have served a shard before. A group with nothing left falls back to any
+    /// host, so a slab still fills when a pool has run short.
+    fn pick_group(&mut self, group: Group) -> Option<(PublicKey, InflightGuard)> {
         if self.available.len() <= self.pending_initial {
             return None;
         }
@@ -510,6 +584,9 @@ impl HostQueue {
                 .hosts
                 .transport
                 .host_score(hk, info.inflight_uploads.load(Ordering::Relaxed));
+            if !group.accepts(score.is_unsampled()) {
+                continue;
+            }
             match &best {
                 None => best = Some((i, score, &info.inflight_uploads)),
                 Some((_, current, _)) if score > *current => {
@@ -517,6 +594,10 @@ impl HostQueue {
                 }
                 _ => {}
             }
+        }
+        if best.is_none() && group != Group::Any {
+            drop(host_info);
+            return self.pick_group(Group::Any);
         }
         let (i, _, counter) = best?;
         let counter = counter.clone();
@@ -526,10 +607,16 @@ impl HostQueue {
     }
 
     /// Picks a host for a shard's first attempt. Returns `None` once the
-    /// reserve is empty.
+    /// reserve is empty. A third of the slab is spent on hosts nobody has
+    /// tried; the rest reuse hosts that have served a shard before.
     pub(crate) fn pick_initial(&mut self) -> Option<(PublicKey, InflightGuard)> {
         self.pending_initial = self.pending_initial.checked_sub(1)?;
-        self.pick()
+        let explore = self.explore_left > 0;
+        let picked = self.pick_group(if explore { Group::Untried } else { Group::Tried });
+        if explore && picked.is_some() {
+            self.explore_left -= 1;
+        }
+        picked
     }
 
     /// Records a failed attempt and returns the host to the pool. Returns
@@ -1079,6 +1166,134 @@ mod test {
         }
         assert!(queue.swap(host).is_none(), "should respect the attempt cap");
         assert!(queue.pick().is_none());
+    }
+
+    /// A slab spends three shards in ten on hosts nobody has tried and fills the
+    /// rest from hosts that already served one. Before this, every untried host
+    /// outranked every proven one, so a five slab upload re-sampled the same
+    /// dead hosts four times over.
+    #[sia_core_derive::cross_target_test]
+    fn test_host_queue_reuses_proven_hosts_after_a_discovery_budget() {
+        let hosts_manager = Hosts::new(Client::mock());
+        let keys: Vec<_> = (0..20).map(|_| random_pubkey()).collect();
+        hosts_manager.update(
+            keys.iter()
+                .map(|public_key| Host {
+                    public_key: *public_key,
+                    addresses: vec![],
+                    country_code: String::new(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+        // Fourteen hosts have moved a shard before; six have never been tried.
+        for key in &keys[..14] {
+            hosts_manager.record_write_sample(*key, 1_000_000, Duration::from_secs(1));
+        }
+
+        let mut queue = hosts_manager.upload_queue(20);
+        let mut picked = Vec::new();
+        for _ in 0..20 {
+            let (host, guard) = queue.pick_initial().expect("every shard gets a host");
+            drop(guard);
+            picked.push(host);
+        }
+
+        let untried = &keys[14..];
+        // Six shards in twenty is the discovery slice, rounded up from 30%.
+        assert!(
+            picked[..6].iter().all(|host| untried.contains(host)),
+            "the slab should start by trying hosts it has never used",
+        );
+        assert!(
+            picked[6..].iter().all(|host| !untried.contains(host)),
+            "the rest of the slab should reuse hosts that already served a shard",
+        );
+    }
+
+    /// With enough proven hosts to fill the slab, the only discovery left is the
+    /// one pick kept back so a pool that has gone bad is still noticed. This is
+    /// the "host keeps working" case: after the first slab, the same hosts carry
+    /// the next one and nothing is spent looking for new ones.
+    #[sia_core_derive::cross_target_test]
+    fn test_host_queue_keeps_proven_hosts_working_across_slabs() {
+        let hosts_manager = Hosts::new(Client::mock());
+        let keys: Vec<_> = (0..40).map(|_| random_pubkey()).collect();
+        hosts_manager.update(
+            keys.iter()
+                .map(|public_key| Host {
+                    public_key: *public_key,
+                    addresses: vec![],
+                    country_code: String::new(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+        // Thirty hosts have moved a shard, ten have never been tried.
+        for key in &keys[..30] {
+            hosts_manager.record_write_sample(*key, 1_000_000, Duration::from_secs(1));
+        }
+
+        let mut queue = hosts_manager.upload_queue(30);
+        let mut picked = Vec::new();
+        for _ in 0..30 {
+            let (host, guard) = queue.pick_initial().expect("every shard gets a host");
+            drop(guard);
+            picked.push(host);
+        }
+
+        let untried = &keys[30..];
+        assert_eq!(
+            picked.iter().filter(|host| untried.contains(host)).count(),
+            1,
+            "one pick is kept back for discovery, the rest should reuse proven hosts",
+        );
+        assert_eq!(
+            picked.iter().filter(|host| !untried.contains(host)).count(),
+            29,
+            "the slab should spend 29 of its 30 shards on hosts that already worked",
+        );
+    }
+
+    /// With nothing proven yet, the slice is all there is, so a first slab is
+    /// still pure discovery.
+    #[sia_core_derive::cross_target_test]
+    fn test_host_queue_explores_everything_when_nothing_is_proven() {
+        let hosts_manager = Hosts::new(Client::mock());
+        let keys: Vec<_> = (0..10).map(|_| random_pubkey()).collect();
+        hosts_manager.update(
+            keys.iter()
+                .map(|public_key| Host {
+                    public_key: *public_key,
+                    addresses: vec![],
+                    country_code: String::new(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+
+        let mut queue = hosts_manager.upload_queue(10);
+        let mut picked = Vec::new();
+        for _ in 0..10 {
+            let (host, guard) = queue.pick_initial().expect("every shard gets a host");
+            drop(guard);
+            picked.push(host);
+        }
+        let distinct: std::collections::HashSet<_> = picked.iter().collect();
+        assert_eq!(distinct.len(), 10, "a first slab must try ten different hosts");
+        assert!(
+            picked.iter().all(|host| keys.contains(host)),
+            "every pick must come from the pool",
+        );
     }
 
     #[sia_core_derive::cross_target_test]

@@ -18,10 +18,13 @@ impl Sdk {
         key: &SharingKey,
         object: &Object,
     ) -> Result<(), SharingError> {
+        log::debug!("[share] sealing");
         let req = SharedObjectRequest::new(object, &key.0);
+        log::debug!("[share] sealed");
         self.api_client
             .add_shared_object(&self.app_key.0, &key.public_key(), &req)
             .await?;
+        log::debug!("[share] posted");
         Ok(())
     }
 
