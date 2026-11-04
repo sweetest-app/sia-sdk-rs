@@ -1,30 +1,29 @@
-use std::collections::VecDeque;
 use std::io;
 #[cfg(feature = "fs")]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::app_client::{self, SectorPinParams, SlabPinParams};
+use crate::app_client::{self, SlabPinParams};
 use crate::congestion::{InflightController, SamplePermit};
 use crate::encryption::{EncryptionKey, encrypt_shard};
 use crate::erasure_coding::{self, ErasureCoder, ReadSlab, SlabReader};
-use crate::hosts::{QueueError, RPC_IDLE_TIMEOUT, RPCError};
+use crate::hosts::{QueueError, RPCError};
+#[cfg(test)]
 use crate::slabs::SlabVersion;
-use crate::task::AbortOnDropHandle;
 use crate::time::{Duration, Instant, sleep};
 use crate::{
-    AppKey, Download, DownloadOptions, Hosts, Object, PackedUploadOptions, Sector, ShardAttemptCallback,
-    ShardAttemptInfo, ShardProgress, ShardProgressCallback, Slab, UploadOptions,
+    AppKey, Download, DownloadOptions, Hosts, Object, PackedUploadOptions, Slab, UploadOptions,
 };
+#[cfg(test)]
+use crate::{ShardProgress, ShardProgressCallback};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+#[cfg(test)]
+use chrono::Utc;
 use log::debug;
-use sia_core::rhp4::SECTOR_SIZE;
 use sia_core::signing::PublicKey;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{Notify, watch};
-use tokio::task::JoinSet;
+use tokio::sync::Notify;
 
 mod worker;
 
@@ -46,17 +45,7 @@ fn default_slabs_in_memory(_slab_size: usize) -> usize {
 /// in flight.
 struct UploadLimiter {
     inflight: Mutex<usize>,
-    /// Shards whose memory is committed but whose slab hasn't been pinned yet.
-    /// Limits slab encoding so it can't runaway with memory that will sit idle.
-    committed: Mutex<usize>,
-    /// Shards whose last attempt failed and that are queued for another
-    /// permit. They are not in flight and not counted as waiting, so without
-    /// this the state after a failure is invisible.
-    retrying: Mutex<usize>,
     notify: Notify,
-    /// Wakes the slab gate ([`Self::reserve`]) when the backlog drops or the
-    /// limit grows.
-    capacity: Notify,
     controller: InflightController,
 }
 
@@ -64,46 +53,9 @@ impl UploadLimiter {
     fn new(initial: usize, floor: usize, cap: usize) -> Self {
         Self {
             inflight: Mutex::new(0),
-            committed: Mutex::new(0),
-            retrying: Mutex::new(0),
             notify: Notify::new(),
-            capacity: Notify::new(),
             // scale 1: the limited unit (a shard upload) is also the sampled unit
             controller: InflightController::new(initial, floor, cap, 1),
-        }
-    }
-
-    /// Waits until the committed backlog leaves room for another slab, then
-    /// commits `shards` and returns one [`ShardPermit`] per shard. The backlog
-    /// is allowed to reach `limit + shards`. Enough to keep `limit` shards in
-    /// flight plus one slab of lookahead, so slabs interleave within the memory
-    /// budge.
-    async fn reserve(self: &Arc<Self>, shards: usize) -> Vec<ShardPermit> {
-        let notified = self.capacity.notified();
-        tokio::pin!(notified);
-        loop {
-            // Register before checking so a wake between the check and the
-            // await isn't lost.
-            notified.as_mut().enable();
-            {
-                let mut committed = self.committed.lock().unwrap();
-                // `limit + shards`: the in-flight target plus a slab of
-                // lookahead. `+ shards <= cap`: the new slab must still fit the
-                // memory budget. The first slab always fits since `shards <=
-                // cap`, so a slab larger than the limit never deadlocks.
-                if *committed < self.controller.limit() + shards
-                    && *committed + shards <= self.controller.cap()
-                {
-                    *committed += shards;
-                    return (0..shards)
-                        .map(|_| ShardPermit {
-                            limiter: self.clone(),
-                        })
-                        .collect();
-                }
-            }
-            notified.as_mut().await;
-            notified.set(self.capacity.notified());
         }
     }
 
@@ -119,15 +71,6 @@ impl UploadLimiter {
             }
             notified.as_mut().await;
             notified.set(self.notify.notified());
-        }
-    }
-
-    /// Marks a shard as queued for a new permit after a failed attempt. The
-    /// guard must be dropped once the shard has a permit again.
-    fn begin_retry(self: &Arc<Self>) -> RetryGuard {
-        *self.retrying.lock().unwrap() += 1;
-        RetryGuard {
-            limiter: self.clone(),
         }
     }
 
@@ -163,10 +106,6 @@ impl UploadLimiter {
         for _ in 0..delta.max(0) {
             self.notify.notify_one();
         }
-        if delta > 0 {
-            // the limit grew recheck the slab gate
-            self.capacity.notify_one();
-        }
     }
 }
 
@@ -180,33 +119,6 @@ impl Drop for UploadPermit {
     fn drop(&mut self) {
         *self.limiter.inflight.lock().unwrap() -= 1;
         self.limiter.notify.notify_one();
-    }
-}
-
-/// Reservation for one buffered shard's memory, issued by
-/// [`UploadLimiter::reserve`]. Held from encode until the shard's slab is
-/// pinned, since the shard stays in memory for possible reupload. Dropping
-/// it, including when the slab fails or is cancelled, frees the slot in the
-/// backlog and wakes the slab gate.
-struct ShardPermit {
-    limiter: Arc<UploadLimiter>,
-}
-
-impl Drop for ShardPermit {
-    fn drop(&mut self) {
-        *self.limiter.committed.lock().unwrap() -= 1;
-        self.limiter.capacity.notify_one();
-    }
-}
-
-/// Marker for a shard waiting on a new permit after a failed attempt.
-struct RetryGuard {
-    limiter: Arc<UploadLimiter>,
-}
-
-impl Drop for RetryGuard {
-    fn drop(&mut self) {
-        *self.limiter.retrying.lock().unwrap() -= 1;
     }
 }
 
@@ -315,18 +227,13 @@ const MAX_SLAB_ATTEMPTS: usize = 3;
 /// [finish](Upload::finish) to recover the uploaded slabs.
 pub(crate) struct Upload {
     client: Hosts,
-    api_client: app_client::Client,
     app_key: Arc<AppKey>,
     erasure_coder: Arc<ErasureCoder>,
     total_shards: usize,
     slab_buffer: Option<SlabReader>,
-    /// Adaptive limit on shards in flight and buffered slabs
-    limiter: Arc<UploadLimiter>,
     /// The worker pool and the request queue. A slab is registered here once it
     /// is encoded, and a connected host pulls its shards.
     state: Arc<worker::WorkerState>,
-    shard_uploaded: Option<ShardProgressCallback>,
-    shard_attempt: Option<ShardAttemptCallback>,
 }
 
 impl Upload {
@@ -356,15 +263,13 @@ impl Upload {
             client.clone(),
             api_client.clone(),
             app_key.clone(),
-            limiter.clone(),
-            total_shards,
+            limiter,
             max_buffered_slabs,
             options.shard_uploaded.clone(),
             options.shard_attempt.clone(),
         ));
         Ok(Self {
             client,
-            api_client,
             app_key,
             slab_buffer: Some(SlabReader::new(
                 options.data_shards as usize,
@@ -372,10 +277,7 @@ impl Upload {
             )),
             erasure_coder: Arc::new(erasure_coder),
             total_shards,
-            limiter,
             state,
-            shard_uploaded: options.shard_uploaded,
-            shard_attempt: options.shard_attempt,
         })
     }
 

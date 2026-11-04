@@ -92,6 +92,9 @@ impl Client {
     /// others say true, which keeps a failed write a failure of the host rather
     /// than a session that was never tracked.
     pub(crate) fn is_connected(&self, host_key: &PublicKey) -> bool {
+        // Only the browser transport uses the key; the arm that does not is
+        // the whole function on other targets.
+        let _ = host_key;
         match self {
             #[cfg(target_arch = "wasm32")]
             Self::WebTransport(c) => c.is_connected(host_key),
@@ -100,6 +103,7 @@ impl Client {
     }
 
     pub(crate) fn handshake_time(&self, host_key: &PublicKey) -> Option<Duration> {
+        let _ = host_key;
         match self {
             #[cfg(target_arch = "wasm32")]
             Self::WebTransport(c) => c.handshake_time(host_key),

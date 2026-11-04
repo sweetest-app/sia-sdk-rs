@@ -62,7 +62,7 @@ impl<V: HostView> HostPool<V> {
         Self {
             view,
             candidates,
-            banned: SharedBans::new(),
+            banned,
             connected: HashSet::new(),
             dialling: HashSet::new(),
             target,
@@ -401,6 +401,26 @@ mod tests {
         let replacement = pool.plan();
         assert_eq!(replacement.len(), 1);
         assert_ne!(replacement[0], victim);
+    }
+
+    #[test]
+    fn a_ban_through_a_shared_set_is_visible_to_a_new_pool() {
+        // The page keeps one ban set. A new upload builds a new pool over the
+        // same set, so a host banned last time must not be dialled again.
+        let list = keys(2);
+        let bans = SharedBans::new();
+        let mut first = HostPool::with_bans(FakeView::new(), list.clone(), 1, bans.clone());
+        let bad = first.plan()[0];
+        first.settle(bad, Some(BanReason::DialTimeout));
+        drop(first);
+
+        let mut second = HostPool::with_bans(FakeView::new(), list.clone(), 1, bans);
+        assert!(second.is_banned(&bad), "the new pool must see the ban");
+        assert_eq!(
+            second.plan(),
+            vec![list.iter().copied().find(|host| *host != bad).unwrap()],
+            "and dial the host that is left",
+        );
     }
 
     #[test]

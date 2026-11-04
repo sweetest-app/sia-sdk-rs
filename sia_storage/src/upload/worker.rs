@@ -34,14 +34,18 @@ const PARK: Duration = Duration::from_millis(100);
 
 /// Host statistics for the pool's dial score.
 ///
-/// The only number the pool uses is the write rate, which the metric layer does
-/// not expose yet, so every candidate is scored on its own dial record. The pool
-/// still ranks by that record, which is what the bans are for.
+/// The pool ranks candidates by the write rate the transport has measured, so a
+/// host that has proven itself is dialled before one nobody has tried. A host
+/// with no measurement is `unsampled`, and the pool gives it the median rate of
+/// what is connected.
 pub(crate) struct HostsView(pub(crate) Hosts);
 
 impl HostView for HostsView {
-    fn stats(&self, _host: &PublicKey) -> HostStats {
-        HostStats::unsampled()
+    fn stats(&self, host: &PublicKey) -> HostStats {
+        match self.0.write_throughput(host) {
+            Some(bytes_per_second) => HostStats::with_write_rate(bytes_per_second),
+            None => HostStats::unsampled(),
+        }
     }
 }
 
@@ -88,7 +92,6 @@ impl WorkerState {
         api_client: app_client::Client,
         app_key: Arc<AppKey>,
         limiter: Arc<UploadLimiter>,
-        total_shards: usize,
         max_buffered: usize,
         progress: Option<ShardProgressCallback>,
         attempt: Option<ShardAttemptCallback>,

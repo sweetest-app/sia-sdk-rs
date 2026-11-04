@@ -12,7 +12,6 @@ use sia_core::types::v2::NetAddress;
 use thiserror::Error;
 
 use crate::client::Client;
-use crate::client::metrics::HostScore;
 #[cfg(test)]
 use crate::client::metrics::{HostMetric, Transfer};
 use crate::rhp4::HostEndpoint;
@@ -161,7 +160,23 @@ impl Hosts {
         items.sort_by_cached_key(|item| {
             let key = f(item);
             let inflight = host_info[key].inflight_downloads.load(Ordering::Relaxed);
-            std::cmp::Reverse(self.transport.host_score(key, inflight))
+            let metric = self.transport.host_metric(key);
+            let throughput = metric.combined_throughput();
+            // Expected throughput if one more download started here. `to_bits`
+            // keeps this a total order: throughput is never negative or NaN,
+            // and IEEE754 bit patterns sort with the value in that range.
+            let expected = throughput
+                .map(|t| (t / (inflight as f64 + 1.0)).to_bits())
+                .unwrap_or(0);
+            // Ascending key, every component written worst-first:
+            // fewer failures, unsampled before sampled (discovery), then the
+            // highest expected throughput, then the least busy.
+            (
+                metric.failure_rate(),
+                throughput.is_some(),
+                std::cmp::Reverse(expected),
+                inflight,
+            )
         });
     }
 
@@ -330,6 +345,16 @@ impl Hosts {
 
     pub fn write_estimate(&self, bytes: u32) -> Duration {
         self.transport.write_estimate(bytes)
+    }
+
+    /// Bytes per second this host has written, once any shard has landed on it.
+    /// `None` means nothing has been measured yet. The worker pool's dial score
+    /// reads this, so a host that has proven slow is dialled after a fast one.
+    pub(crate) fn write_throughput(&self, host_key: &PublicKey) -> Option<f64> {
+        self.transport
+            .host_metric(host_key)
+            .write_throughput()
+            .map(|rate| *rate)
     }
 
     pub fn read_estimate(&self, bytes: u32) -> Duration {
@@ -629,9 +654,9 @@ mod test {
 
     /// A timing out sector RPC must cost the host a failure sample.
     ///
-    /// Without one its rate stays 0, and `HostScore` ranks an unsampled host
-    /// above every measured one as a discovery preference, so the host that
-    /// just timed out is picked first again.
+    /// Without one its rate stays 0, and the download ranking puts an
+    /// unsampled host above every measured one as a discovery preference, so
+    /// the host that just timed out is picked first again.
     ///
     /// Each RPC gets its own host, so each starts unsampled and the assertion
     /// cannot be satisfied by the other RPC's failure.
@@ -915,5 +940,65 @@ mod test {
             "host with higher download inflight should sort second",
         );
         assert_eq!(items[1], initial_first);
+    }
+
+    /// The download ranking, in the one place that sorts.
+    ///
+    /// Order: fewest failures, then unsampled hosts (discovery), then the
+    /// highest `throughput / (inflight + 1)`.
+    #[sia_core_derive::cross_target_test]
+    fn prioritize_ranks_failures_then_discovery_then_throughput() {
+        let hosts_manager = Hosts::new(Client::mock());
+        let failing = upload_host();
+        let unsampled = upload_host();
+        let slow = upload_host();
+        let fast = upload_host();
+        let mut entries = vec![
+            failing.clone(),
+            unsampled.clone(),
+            slow.clone(),
+            fast.clone(),
+        ];
+        hosts_manager.update(std::mem::take(&mut entries), true);
+
+        hosts_manager.add_read_sample(failing.public_key, Transfer::new(1_000_000, Duration::from_secs(1)));
+        hosts_manager.add_failure(failing.public_key);
+        hosts_manager.add_read_sample(slow.public_key, Transfer::new(100, Duration::from_secs(1)));
+        hosts_manager.add_read_sample(fast.public_key, Transfer::new(1000, Duration::from_secs(1)));
+
+        let mut items = vec![
+            failing.public_key,
+            unsampled.public_key,
+            slow.public_key,
+            fast.public_key,
+        ];
+        hosts_manager.prioritize(&mut items, |key| key);
+        assert_eq!(
+            items,
+            vec![
+                unsampled.public_key,
+                fast.public_key,
+                slow.public_key,
+                failing.public_key,
+            ],
+            "clean before failing, unsampled before sampled, faster first",
+        );
+
+        // A busy host loses to an idle one of the same speed, which is what
+        // spreads concurrent downloads across hosts.
+        let _guards: Vec<_> = (0..12)
+            .map(|_| {
+                hosts_manager
+                    .reserve_inflight_download(&fast.public_key)
+                    .unwrap()
+            })
+            .collect();
+        let mut items = vec![fast.public_key, slow.public_key];
+        hosts_manager.prioritize(&mut items, |key| key);
+        assert_eq!(
+            items,
+            vec![slow.public_key, fast.public_key],
+            "10x the throughput split 13 ways is less than the idle host",
+        );
     }
 }

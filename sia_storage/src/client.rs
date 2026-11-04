@@ -9,7 +9,7 @@ use sia_core::signing::{PrivateKey, PublicKey};
 use sia_core::types::Hash256;
 use tokio::sync::watch;
 
-use self::metrics::{HostMetric, HostScore, RPCAverage, Transfer, TransferRate};
+use self::metrics::{HostMetric, RPCAverage, Transfer, TransferRate};
 use self::prices::{PriceEntry, PriceFetch};
 use crate::rhp4::{self, Error, HostEndpoint};
 use crate::task::AbortOnDropHandle;
@@ -129,12 +129,16 @@ impl Client {
         Self::with_transport(rhp4::Client::mock())
     }
 
-    pub(crate) fn host_score(&self, host: &PublicKey, inflight: usize) -> HostScore {
-        let metrics = self.metrics.hosts.read().unwrap();
-        HostScore::new(
-            metrics.get(host).unwrap_or(&HostMetric::default()),
-            inflight,
-        )
+    /// A copy of this host's metric. The download ranking computes its sort
+    /// key from it, so the ranking stays in the one place that sorts.
+    pub(crate) fn host_metric(&self, host: &PublicKey) -> HostMetric {
+        self.metrics
+            .hosts
+            .read()
+            .unwrap()
+            .get(host)
+            .cloned()
+            .unwrap_or_default()
     }
 
     #[cfg(test)]

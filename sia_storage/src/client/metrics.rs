@@ -193,15 +193,14 @@ impl HostMetric {
     }
 
     /// The failure rate as an integer percentage. Zero for an unsampled host,
-    /// which [`HostScore`] deliberately treats as good.
-    #[cfg(test)]
+    /// which the download ranking deliberately treats as good.
     pub(crate) fn failure_rate(&self) -> i64 {
         self.failure_rate.rate()
     }
 
     /// Combined read + write throughput average. `None` only when neither side
-    /// has been sampled. Used by [`HostScore`] for the discovery preference
-    /// (unsampled outranks sampled).
+    /// has been sampled. `Hosts::prioritize` reads this for its discovery
+    /// preference (unsampled before sampled).
     pub(crate) fn combined_throughput(&self) -> Option<TransferRate> {
         match (self.rpc_write_avg.avg(), self.rpc_read_avg.avg()) {
             (None, None) => None,
@@ -209,78 +208,11 @@ impl HostMetric {
             (Some(v), None) | (None, Some(v)) => Some(v),
         }
     }
-}
 
-/// Score for picking the next upload host. Higher is better.
-///
-/// Sort order:
-/// 1. Lower `failure_rate` wins.
-/// 2. Unsampled hosts (no throughput data) outrank sampled ones — this is
-///    the "discovery" preference so every available host eventually gets
-///    tried at least once.
-/// 3. Among sampled hosts, higher `throughput / (inflight + 1)` wins —
-///    the expected per-shard throughput if you added one more shard. That
-///    penalizes already-busy hosts proportionally to load, so a saturated
-///    fast host can lose to an idle slower one, while a genuinely much
-///    faster host still wins even when serving a few shards.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct HostScore {
-    failure_rate: i64,
-    throughput: Option<TransferRate>,
-    inflight: usize,
-}
-
-impl HostScore {
-    pub(crate) fn new(metric: &HostMetric, inflight: usize) -> Self {
-        Self {
-            failure_rate: metric.failure_rate.rate(),
-            throughput: metric.combined_throughput(),
-            inflight,
-        }
-    }
-
-    pub(crate) fn weighted_throughput(&self) -> Option<TransferRate> {
-        self.throughput.map(|t| t / (self.inflight as f64 + 1.0))
-    }
-
-    /// Whether this host has never completed a transfer, so there is nothing to
-    /// judge it by beyond the absence of failures. The host queue spends a fixed
-    /// slice of each slab on these and fills the rest from hosts it has seen.
-    pub(crate) fn is_unsampled(&self) -> bool {
-        self.throughput.is_none()
-    }
-}
-
-impl PartialEq for HostScore {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
-    }
-}
-
-impl Eq for HostScore {}
-
-impl Ord for HostScore {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Lower failure_rate is better (so invert here for max-comparison).
-        match other.failure_rate.cmp(&self.failure_rate) {
-            std::cmp::Ordering::Equal => match (self.throughput, other.throughput) {
-                (None, None) => other.inflight.cmp(&self.inflight),
-                // discovery: unsampled outranks sampled
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (Some(_), Some(_)) => self
-                    .weighted_throughput()
-                    .unwrap()
-                    .total_cmp(&other.weighted_throughput().unwrap()),
-            },
-            ord => ord,
-        }
-    }
-}
-
-impl PartialOrd for HostScore {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+    /// Write throughput average, which is what the worker pool ranks dial
+    /// candidates by. `None` until a shard has landed on the host.
+    pub(crate) fn write_throughput(&self) -> Option<TransferRate> {
+        self.rpc_write_avg.avg()
     }
 }
 
@@ -550,98 +482,36 @@ mod test {
     }
 
     #[sia_core_derive::cross_target_test]
-    fn test_host_metric_ordering() {
-        // Sorting a list of HostMetric by HostScore (inflight=0) should
-        // descend by failure_rate then by throughput.
-        let mut hosts = vec![
-            HostMetric::default(),
-            HostMetric::default(),
-            HostMetric::default(),
-        ];
-        hosts[0].failure_rate.add_sample(false);
-        hosts[1].failure_rate.add_sample(false);
-        hosts[2].failure_rate.add_sample(false);
-        for _ in 0..10 {
-            hosts[0].failure_rate.add_sample(true);
-        }
-        for _ in 0..5 {
-            hosts[1].failure_rate.add_sample(true);
-        }
-        // Sort by HostScore ascending; reverse to get desc.
-        hosts.sort_by(|a, b| HostScore::new(a, 0).cmp(&HostScore::new(b, 0)));
-        let rates = hosts
-            .into_iter()
-            .rev()
-            .map(|h| h.failure_rate)
-            .collect::<Vec<FailureRate>>();
-        assert!(
-            rates.is_sorted(),
-            "hosts should be sorted by failure rate desc"
+    fn test_host_metric_ranking_inputs() {
+        // The download ranking itself lives in `Hosts::prioritize`. This
+        // checks the two numbers it reads off a metric, so a change here
+        // cannot quietly change that order.
+        let unsampled = HostMetric::default();
+        assert_eq!(unsampled.failure_rate(), 0);
+        assert_eq!(unsampled.combined_throughput(), None);
+
+        let mut sampled = HostMetric::default();
+        sampled.add_write_sample(Transfer::new(100, Duration::from_secs(1)));
+        assert_eq!(sampled.failure_rate(), 0);
+        assert_eq!(
+            sampled.combined_throughput(),
+            Some(Transfer::new(100, Duration::from_secs(1)).rate())
         );
 
-        let mut hosts = vec![
-            HostMetric::default(),
-            HostMetric::default(),
-            HostMetric::default(),
-        ];
-        hosts[0]
-            .rpc_write_avg
-            .add_sample(Transfer::new(100, Duration::from_secs(1)).rate());
-        hosts[1]
-            .rpc_write_avg
-            .add_sample(Transfer::new(1000, Duration::from_secs(1)).rate());
-        hosts[2]
-            .rpc_write_avg
-            .add_sample(Transfer::new(500, Duration::from_secs(1)).rate());
-        hosts.sort_by(|a, b| HostScore::new(a, 0).cmp(&HostScore::new(b, 0)));
-        let rates = hosts
-            .into_iter()
-            .rev()
-            .map(|h| h.rpc_write_avg.avg())
-            .collect::<Vec<_>>();
-        assert!(
-            rates.is_sorted_by(|a, b| a >= b),
-            "hosts should be sorted by rpc write avg desc"
-        );
-    }
-
-    #[sia_core_derive::cross_target_test]
-    fn test_host_ranking() {
-        // End-to-end host ranking via HostScore at the metric layer.
-        // All-unsampled, all-equal: HostScore::new with inflight=0 is the
-        // pure-quality ranking and ties for hosts with no samples.
-        let unsampled_a = HostScore::new(&HostMetric::default(), 0);
-        let unsampled_b = HostScore::new(&HostMetric::default(), 0);
-        assert_eq!(unsampled_a.cmp(&unsampled_b), std::cmp::Ordering::Equal);
-
-        // Sample one host: unsampled now outranks it (discovery preference).
-        let sampled_slow = {
-            let mut m = HostMetric::default();
-            m.add_write_sample(Transfer::new(100, Duration::from_secs(1)));
-            m
-        };
-        let sampled_slow_score = HostScore::new(&sampled_slow, 0);
-        assert!(
-            unsampled_a > sampled_slow_score,
-            "unsampled should outrank sampled (discovery)",
+        // Read and write averages are combined, so a host that only serves
+        // reads is not ranked as unsampled.
+        let mut read_only = HostMetric::default();
+        read_only.add_read_sample(Transfer::new(400, Duration::from_secs(1)));
+        assert_eq!(
+            read_only.combined_throughput(),
+            Some(Transfer::new(400, Duration::from_secs(1)).rate())
         );
 
-        // Among sampled, faster wins.
-        let sampled_fast = {
-            let mut m = HostMetric::default();
-            m.add_read_sample(Transfer::new(1000, Duration::from_secs(1)));
-            m
-        };
-        let sampled_fast_score = HostScore::new(&sampled_fast, 0);
-        assert!(sampled_fast_score > sampled_slow_score);
-
-        // Failure trumps throughput.
-        let failing_fast = {
-            let mut m = sampled_fast.clone();
-            m.add_failure();
-            m
-        };
-        let failing_fast_score = HostScore::new(&failing_fast, 0);
-        assert!(failing_fast_score < sampled_slow_score);
+        // A failure with no throughput still reads as unsampled, and carries
+        // its rate, which is what puts it behind every clean host.
+        let mut failed = HostMetric::default();
+        failed.add_failure();
+        assert_eq!(failed.combined_throughput(), None);
+        assert_eq!(failed.failure_rate(), 100);
     }
 }

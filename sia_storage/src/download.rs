@@ -75,7 +75,7 @@ const MAX_SECTOR_ATTEMPTS: usize = 3;
 const RACE_WINDOW: usize = 3;
 
 /// How long a chunk waits before a second host is raced against the first.
-const DOWNLOAD_RACE_FACTOR: f64 = 1.5;
+const SPECULATION_FACTOR: f64 = 1.5;
 
 const INITIAL_INFLIGHT: usize = 8;
 const MIN_INFLIGHT: usize = 1;
@@ -295,10 +295,10 @@ impl SlabRecovery<AwaitingRecovery> {
         let end = (self.offset + self.length).div_ceil(chunk_size) * SEGMENT_SIZE;
         let shard_offset = start;
         let shard_length = end - start;
-        let download_race_timeout = self
+        let speculation_timeout = self
             .client
             .read_estimate(shard_length as u32)
-            .mul_f64(DOWNLOAD_RACE_FACTOR);
+            .mul_f64(SPECULATION_FACTOR);
 
         // overprovision the recovery to reduce tail latency from slow hosts;
         // the chunk the reader is waiting on tries every host at once
@@ -380,7 +380,7 @@ impl SlabRecovery<AwaitingRecovery> {
                     }
                 },
                 // Fires once racing will not steal work from more important chunks and the race timeout has elapsed
-                _ = sleep((last_event + download_race_timeout).saturating_duration_since(Instant::now())), if eligible && !sectors.is_empty() => {
+                _ = sleep((last_event + speculation_timeout).saturating_duration_since(Instant::now())), if eligible && !sectors.is_empty() => {
                     let elapsed = last_event.elapsed();
                     last_event = Instant::now();
                     let (task, _) = sectors.pop_front().expect("sectors should not be empty");
