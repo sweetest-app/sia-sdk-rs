@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 #[cfg(feature = "fs")]
 use std::path::Path;
@@ -24,6 +25,7 @@ use sia_core::signing::PublicKey;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Notify;
+use tokio::sync::oneshot;
 
 mod worker;
 
@@ -43,48 +45,52 @@ fn default_slabs_in_memory(_slab_size: usize) -> usize {
 /// Gates concurrent shard uploads at the [`InflightController`]'s current
 /// limit. Replaces a fixed semaphore so the limit can adapt while uploads are
 /// in flight.
+///
+/// Parked workers are served first come, first served. A worker that just
+/// finished a shard cannot barge past one that has been waiting, which is what
+/// makes "the worker idle longest takes the next shard" true rather than
+/// likely. That matters beyond fairness: a host whose session sits unused long
+/// enough closes it, and the session is the expensive thing to get back.
 struct UploadLimiter {
-    inflight: Mutex<usize>,
-    notify: Notify,
+    state: Mutex<LimiterState>,
     controller: InflightController,
+}
+
+#[derive(Default)]
+struct LimiterState {
+    inflight: usize,
+    /// Workers parked in the order they arrived. A slot is handed straight to
+    /// the front of this queue, so the queue is the line.
+    waiters: VecDeque<oneshot::Sender<UploadPermit>>,
 }
 
 impl UploadLimiter {
     fn new(initial: usize, floor: usize, cap: usize) -> Self {
         Self {
-            inflight: Mutex::new(0),
-            notify: Notify::new(),
+            state: Mutex::new(LimiterState::default()),
             // scale 1: the limited unit (a shard upload) is also the sampled unit
             controller: InflightController::new(initial, floor, cap, 1),
         }
     }
 
+    /// Takes a slot, or waits in line for one. The permit is held while the
+    /// shard is written, so the caller cannot take work it may not send.
     async fn acquire(self: &Arc<Self>) -> UploadPermit {
-        let notified = self.notify.notified();
-        tokio::pin!(notified);
-        loop {
-            // Register before checking so a wake between the check and the
-            // await isn't lost.
-            notified.as_mut().enable();
-            if let Some(permit) = self.try_acquire() {
-                return permit;
+        let rx = {
+            let mut state = self.state.lock().unwrap();
+            if state.waiters.is_empty() && state.inflight < self.controller.limit() {
+                state.inflight += 1;
+                return UploadPermit {
+                    limiter: self.clone(),
+                };
             }
-            notified.as_mut().await;
-            notified.set(self.notify.notified());
-        }
-    }
-
-    fn try_acquire(self: &Arc<Self>) -> Option<UploadPermit> {
-        let limit = self.controller.limit();
-        let mut inflight = self.inflight.lock().unwrap();
-        if *inflight < limit {
-            *inflight += 1;
-            Some(UploadPermit {
-                limiter: self.clone(),
-            })
-        } else {
-            None
-        }
+            let (tx, rx) = oneshot::channel();
+            state.waiters.push_back(tx);
+            rx
+        };
+        // A slot is handed over only to the front of the queue, and only once
+        // it has been counted, so this returns a permit that is ready to use.
+        rx.await.expect("the limiter outlives its waiters")
     }
 
     /// Issues a sampling token; capture it at dispatch and hand it back to
@@ -94,31 +100,73 @@ impl UploadLimiter {
     }
 
     /// Reports a write that hit its deadline. Only lowers the limit, so there
-    /// is no slot to wake for.
+    /// is no slot to hand out.
     fn record_timeout(&self, permit: SamplePermit, host: PublicKey) {
         self.controller.record_timeout(permit, host);
     }
 
-    /// Feeds a completion to the controller and wakes parked acquirers for any
-    /// newly opened slots.
-    fn record(&self, permit: SamplePermit, elapsed: Duration, ok: bool) {
+    /// Feeds a completion to the controller and hands any newly opened slots
+    /// to the workers that have waited longest.
+    fn record(self: &Arc<Self>, permit: SamplePermit, elapsed: Duration, ok: bool) {
         let delta = self.controller.record(permit, elapsed, ok);
-        for _ in 0..delta.max(0) {
-            self.notify.notify_one();
+        self.grant(delta.max(0) as usize);
+    }
+
+    /// Hands the slot this worker was holding to the front of the queue, or
+    /// gives it back to the controller when nobody is waiting.
+    fn release(self: &Arc<Self>) {
+        let mut state = self.state.lock().unwrap();
+        while let Some(tx) = state.waiters.pop_front() {
+            match tx.send(UploadPermit {
+                limiter: Arc::clone(self),
+            }) {
+                Ok(()) => return,
+                // That worker gave up while we were handing it the slot. The
+                // permit in the `Err` would drop and re-enter this function
+                // holding the lock, so it is forgotten and the slot stays
+                // counted while the next waiter is offered it.
+                Err(permit) => std::mem::forget(permit),
+            }
+        }
+        state.inflight -= 1;
+    }
+
+    /// Grows the budget by `count` and gives what grew to parked workers.
+    fn grant(self: &Arc<Self>, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.inflight += count;
+        let mut handed = 0;
+        while handed < count {
+            let Some(tx) = state.waiters.pop_front() else {
+                break;
+            };
+            match tx.send(UploadPermit {
+                limiter: Arc::clone(self),
+            }) {
+                Ok(()) => handed += 1,
+                Err(permit) => {
+                    // Same as `release`: give the slot back and try the next
+                    // worker, without dropping the permit under the lock.
+                    std::mem::forget(permit);
+                    state.inflight -= 1;
+                }
+            }
         }
     }
 }
 
-/// Permit for one shard-upload attempt. On drop — including task cancellation —
-/// it releases the slot and wakes a waiter.
+/// Permit for one shard-upload attempt. On drop, including task cancellation,
+/// it passes the slot to the worker that has waited longest.
 struct UploadPermit {
     limiter: Arc<UploadLimiter>,
 }
 
 impl Drop for UploadPermit {
     fn drop(&mut self) {
-        *self.limiter.inflight.lock().unwrap() -= 1;
-        self.limiter.notify.notify_one();
+        self.limiter.release();
     }
 }
 
@@ -743,6 +791,88 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    /// The next slot goes to the worker that has been waiting longest.
+    ///
+    /// Three workers park in a known order, then the only permit is dropped.
+    /// Polling in reverse order is the point: if the newest arrival had barged
+    /// in, it would already hold the slot and the first worker would stay
+    /// parked.
+    #[sia_core_derive::cross_target_test]
+    async fn test_permits_go_to_the_worker_that_waited_longest() {
+        use std::task::{Context, Poll, Waker};
+
+        let limiter = Arc::new(UploadLimiter::new(1, 1, 4));
+        let held = limiter.acquire().await;
+
+        let mut first = Box::pin(limiter.acquire());
+        let mut second = Box::pin(limiter.acquire());
+        let mut third = Box::pin(limiter.acquire());
+        let mut cx = Context::from_waker(Waker::noop());
+        for waiter in [&mut first, &mut second, &mut third] {
+            assert!(
+                waiter.as_mut().poll(&mut cx).is_pending(),
+                "the only slot is held, so every worker must park"
+            );
+        }
+
+        drop(held);
+        assert!(
+            third.as_mut().poll(&mut cx).is_pending(),
+            "the worker that just arrived must not take the slot"
+        );
+        assert!(
+            second.as_mut().poll(&mut cx).is_pending(),
+            "only one slot freed, so only the front of the line is served"
+        );
+        let permit = match first.as_mut().poll(&mut cx) {
+            Poll::Ready(permit) => permit,
+            Poll::Pending => panic!("the worker that waited longest must be served first"),
+        };
+
+        // And the line keeps moving: each release serves exactly one worker.
+        drop(permit);
+        let permit = match second.as_mut().poll(&mut cx) {
+            Poll::Ready(permit) => permit,
+            Poll::Pending => panic!("the second worker is next in line"),
+        };
+        drop(permit);
+        assert!(
+            matches!(third.as_mut().poll(&mut cx), Poll::Ready(_)),
+            "the last worker is served once the others are done"
+        );
+    }
+
+    /// A worker cannot hold a shard it has no permit to send.
+    ///
+    /// The worker loop takes the permit before it asks the queue for work, so
+    /// memory is bounded by the write gate rather than by how many hosts happen
+    /// to be connected. This checks the gate really refuses the next worker
+    /// while the limit is reached.
+    #[sia_core_derive::cross_target_test]
+    async fn test_a_worker_cannot_hold_a_shard_without_a_permit() {
+        use std::task::{Context, Poll, Waker};
+
+        // `UploadLimiter::new` starts at the initial inflight, which is 8, so
+        // hold all of them before asking for a ninth.
+        let limiter = Arc::new(UploadLimiter::new(2, 1, 4));
+        let first = limiter.acquire().await;
+        let second = limiter.acquire().await;
+
+        let mut extra = Box::pin(limiter.acquire());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            extra.as_mut().poll(&mut cx).is_pending(),
+            "a worker at the write limit must not be given work"
+        );
+
+        drop(first);
+        assert!(
+            matches!(extra.as_mut().poll(&mut cx), Poll::Ready(_)),
+            "and it is given one as soon as a permit frees up"
+        );
+        drop(second);
     }
 
     #[sia_core_derive::cross_target_test]
