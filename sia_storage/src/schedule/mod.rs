@@ -4,12 +4,11 @@
 //! write next. It never chooses a host, which is what makes the assignment
 //! pull-based instead of a queue handing out work.
 //!
-//! Nothing calls this yet. The wiring into `Upload` is the task after next, and
-//! this allow goes with it.
-#![allow(dead_code, unused_imports)]
+//! The upload registers each slab here and a connected host pulls the next shard
+//! it is allowed to write. Nothing chooses a host for a shard.
 
 mod queue;
 mod slab;
 
-pub(crate) use queue::{RequestQueue, ShardRequest};
-pub(crate) use slab::{FinishedSlab, SlabId, SlabSeed, SlabTracker};
+pub(crate) use queue::RequestQueue;
+pub(crate) use slab::{FinishedSlab, SlabSeed};

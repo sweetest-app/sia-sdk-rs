@@ -73,7 +73,9 @@ pub struct Sdk {
 const MIN_TIME_BETWEEN_REFRESH: Duration = Duration::from_secs(10);
 
 impl Sdk {
-    /// Creates a new SDK instance.
+    /// Creates a new SDK instance. Used by tests; the app builds through
+    /// [`crate::Builder`], which carries its own timeouts.
+    #[cfg(test)]
     pub(crate) async fn new(
         api_client: app_client::Client,
         app_key: Arc<AppKey>,

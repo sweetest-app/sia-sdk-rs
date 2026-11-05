@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use sia_core::signing::PublicKey;
@@ -34,28 +34,18 @@ impl BanReason {
 /// reason about and stops a bad pool from being walked twice.
 #[derive(Debug, Default)]
 pub(crate) struct BanSet {
-    hosts: HashMap<PublicKey, BanReason>,
+    hosts: HashSet<PublicKey>,
 }
 
 impl BanSet {
-    /// Bans a host. Returns false when it was already banned. The first reason is
-    /// kept, because it is the one that explains the failure.
-    pub(crate) fn ban(&mut self, host: PublicKey, reason: BanReason) -> bool {
-        match self.hosts.entry(host) {
-            std::collections::hash_map::Entry::Occupied(_) => false,
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(reason);
-                true
-            }
-        }
+    /// Bans a host. Returns false when it was already banned. The reason is
+    /// logged by the caller at the moment of the ban, so nothing is kept.
+    pub(crate) fn ban(&mut self, host: PublicKey) -> bool {
+        self.hosts.insert(host)
     }
 
     pub(crate) fn contains(&self, host: &PublicKey) -> bool {
-        self.hosts.contains_key(host)
-    }
-
-    pub(crate) fn reason(&self, host: &PublicKey) -> Option<BanReason> {
-        self.hosts.get(host).copied()
+        self.hosts.contains(host)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -79,16 +69,12 @@ impl SharedBans {
         self.0.lock().unwrap().contains(host)
     }
 
-    pub(crate) fn reason(&self, host: &PublicKey) -> Option<BanReason> {
-        self.0.lock().unwrap().reason(host)
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.0.lock().unwrap().len()
     }
 
-    pub(crate) fn ban(&self, host: PublicKey, reason: BanReason) -> bool {
-        self.0.lock().unwrap().ban(host, reason)
+    pub(crate) fn ban(&self, host: PublicKey) -> bool {
+        self.0.lock().unwrap().ban(host)
     }
 }
 
@@ -111,27 +97,20 @@ mod tests {
     }
 
     #[test]
-    fn a_banned_host_stays_banned_and_keeps_its_reason() {
+    fn a_banned_host_stays_banned() {
         let mut bans = BanSet::default();
         assert!(!bans.contains(&key(1)));
 
-        assert!(bans.ban(key(1), BanReason::DialTimeout), "first ban is new");
+        assert!(bans.ban(key(1)), "first ban is new");
         assert!(bans.contains(&key(1)));
-        assert_eq!(bans.reason(&key(1)), Some(BanReason::DialTimeout));
-
-        assert!(!bans.ban(key(1), BanReason::WriteFailed), "already banned");
-        assert_eq!(
-            bans.reason(&key(1)),
-            Some(BanReason::DialTimeout),
-            "the first reason is the one worth logging",
-        );
+        assert!(!bans.ban(key(1)), "already banned");
         assert_eq!(bans.len(), 1);
     }
 
     #[test]
     fn banning_one_host_does_not_ban_another() {
         let mut bans = BanSet::default();
-        bans.ban(key(1), BanReason::DialRefused);
+        bans.ban(key(1));
         assert!(!bans.contains(&key(2)));
         assert_eq!(bans.len(), 1);
     }
@@ -141,7 +120,7 @@ mod tests {
         let bans = SharedBans::new();
         let other = bans.clone();
         assert!(!other.contains(&key(1)));
-        bans.ban(key(1), BanReason::DialTimeout);
+        bans.ban(key(1));
         assert!(
             other.contains(&key(1)),
             "every upload shares one set, so a ban from one is a ban for the next",

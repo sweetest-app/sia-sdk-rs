@@ -15,8 +15,6 @@ use crate::time::{Duration, Instant, sleep};
 use crate::{
     AppKey, Download, DownloadOptions, Hosts, Object, PackedUploadOptions, Slab, UploadOptions,
 };
-#[cfg(test)]
-use crate::{ShardProgress, ShardProgressCallback};
 use bytes::Bytes;
 #[cfg(test)]
 use chrono::Utc;
@@ -755,10 +753,6 @@ mod tests {
             length: 1,
         }
     }
-
-    /// Number of fast hosts [`racing_setup`] seeds alongside the slow one.
-    const FAST_HOSTS: usize = 5;
-
 
     #[sia_core_derive::cross_target_test]
     fn test_validate_ec_params() {

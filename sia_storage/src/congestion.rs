@@ -157,6 +157,7 @@ impl InflightController {
         self.state.lock().unwrap().limit
     }
 
+    #[cfg(test)]
     pub(crate) fn cap(&self) -> usize {
         self.state.lock().unwrap().cap
     }

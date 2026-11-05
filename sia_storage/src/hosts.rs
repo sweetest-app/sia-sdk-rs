@@ -343,10 +343,6 @@ impl Hosts {
         self.transport.is_connected(host_key)
     }
 
-    pub fn write_estimate(&self, bytes: u32) -> Duration {
-        self.transport.write_estimate(bytes)
-    }
-
     /// Bytes per second this host has written, once any shard has landed on it.
     /// `None` means nothing has been measured yet. The worker pool's dial score
     /// reads this, so a host that has proven slow is dialled after a fast one.
@@ -458,10 +454,6 @@ impl Hosts {
     /// Adds a write sample for the given host, updating its metrics.
     fn add_write_sample(&self, host_key: PublicKey, transfer: Transfer) {
         self.with_metric(&host_key, |m| m.add_write_sample(transfer));
-    }
-
-    pub fn record_write_sample(&self, host_key: PublicKey, size: u32, elapsed: Duration) {
-        self.transport.seed_write_sample(host_key, size, elapsed);
     }
 
     pub fn record_read_sample(&self, host_key: PublicKey, size: u32, elapsed: Duration) {
@@ -609,7 +601,6 @@ mod test {
             64,
             "settings and write RPCs each record one success"
         );
-        assert_eq!(first.write_estimate(1024), second.write_estimate(1024));
         let tokens = AccountTokenSource::from(Arc::new(AppKey::import([7; 32])));
         assert_eq!(
             second
@@ -621,7 +612,6 @@ mod test {
         assert_eq!(rate(), 51);
         assert_eq!(first.read_estimate(1024), second.read_estimate(1024));
 
-        let write_estimate = first.write_estimate(1024);
         let read_estimate = first.read_estimate(1024);
         first.update(vec![], true);
         assert!(first.host_endpoint(key).is_err());
@@ -632,7 +622,6 @@ mod test {
         let third = Hosts::new(client);
         third.update(vec![host], true);
         assert_eq!(third.transport.failure_rate(key), 51);
-        assert_eq!(third.write_estimate(1024), write_estimate);
         assert_eq!(third.read_estimate(1024), read_estimate);
     }
 

@@ -77,14 +77,6 @@ impl SlabTracker {
         }
     }
 
-    pub(crate) fn id(&self) -> SlabId {
-        self.id
-    }
-
-    pub(crate) fn total(&self) -> usize {
-        self.total
-    }
-
     pub(crate) fn order(&self) -> u64 {
         self.order
     }
@@ -93,6 +85,7 @@ impl SlabTracker {
         self.sectors.iter().filter(|slot| slot.is_none()).count()
     }
 
+    #[cfg(test)]
     pub(crate) fn placed(&self) -> usize {
         self.sectors.iter().filter(|slot| slot.is_some()).count()
     }

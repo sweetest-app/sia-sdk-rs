@@ -134,24 +134,9 @@ impl RequestQueue {
         self.pending.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn open_slabs(&self) -> usize {
         self.slabs.len()
-    }
-
-    /// A one line summary for the upload log.
-    pub(crate) fn describe(&self) -> String {
-        let mut parts: Vec<String> = self
-            .slabs
-            .values()
-            .map(|slab| format!("{} {}/{}", slab.id().0, slab.placed(), slab.total()))
-            .collect();
-        parts.sort();
-        format!(
-            "{} pending across {} slabs [{}]",
-            self.pending.len(),
-            self.slabs.len(),
-            parts.join(", "),
-        )
     }
 }
 
@@ -359,15 +344,6 @@ mod tests {
         assert_eq!(place(&mut queue, host, &request), Some(slab));
         assert!(queue.take(&key(2)).is_none());
         assert_eq!(place(&mut queue, host, &request), None, "the slab is gone");
-    }
-
-    #[test]
-    fn describe_names_every_open_slab() {
-        let mut queue = RequestQueue::new();
-        add(&mut queue, 2);
-        add(&mut queue, 1);
-        let line = queue.describe();
-        assert!(line.contains("3 pending across 2 slabs"), "{line}");
     }
 
     #[test]

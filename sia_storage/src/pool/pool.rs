@@ -4,7 +4,9 @@ use log::debug;
 use sia_core::signing::PublicKey;
 
 use super::bans::{BanReason, SharedBans};
-use super::score::{dial_score, HostStats, HostView};
+use super::score::{dial_score, HostView};
+#[cfg(test)]
+use super::score::HostStats;
 
 /// Why a worker left the pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +49,7 @@ struct Record {
 }
 
 impl<V: HostView> HostPool<V> {
+    #[cfg(test)]
     pub(crate) fn new(view: V, candidates: Vec<PublicKey>, target: usize) -> Self {
         Self::with_bans(view, candidates, target, SharedBans::new())
     }
@@ -72,22 +75,22 @@ impl<V: HostView> HostPool<V> {
         }
     }
 
-    pub(crate) fn target(&self) -> usize {
-        self.target
-    }
-
+    #[cfg(test)]
     pub(crate) fn connected(&self) -> usize {
         self.connected.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn banned(&self) -> usize {
         self.banned.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_connected(&self, host: &PublicKey) -> bool {
         self.connected.contains(host)
     }
 
+    #[cfg(test)]
     pub(crate) fn is_banned(&self, host: &PublicKey) -> bool {
         self.banned.contains(host)
     }
@@ -185,6 +188,7 @@ impl<V: HostView> HostPool<V> {
 
     /// Releases a reservation without judging the host, for a dial that was
     /// abandoned before it finished.
+    #[cfg(test)]
     pub(crate) fn cancel_dial(&mut self, host: PublicKey) {
         self.dialling.remove(&host);
     }
@@ -205,6 +209,7 @@ impl<V: HostView> HostPool<V> {
     }
 
     /// True when the pool cannot reach its target and has nothing left to dial.
+    #[cfg(test)]
     pub(crate) fn exhausted(&self) -> bool {
         self.connected.len() + self.dialling.len() < self.target
             && self.candidates.iter().all(|host| {
@@ -227,7 +232,7 @@ impl<V: HostView> HostPool<V> {
     }
 
     fn ban(&mut self, host: PublicKey, reason: BanReason) {
-        if self.banned.ban(host, reason) {
+        if self.banned.ban(host) {
             debug!(
                 "[pool] banned {}: {} ({} banned of {} candidates)",
                 short(&host),

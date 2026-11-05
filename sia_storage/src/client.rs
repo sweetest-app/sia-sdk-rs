@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use chrono::Utc;
-use sia_core::rhp4::{HostPrices, SECTOR_SIZE};
+use sia_core::rhp4::HostPrices;
 use sia_core::signing::{PrivateKey, PublicKey};
 use sia_core::types::Hash256;
 use tokio::sync::watch;
@@ -33,7 +33,6 @@ pub(crate) struct Client {
 #[derive(Debug, Default)]
 pub(crate) struct Metrics {
     hosts: RwLock<HashMap<PublicKey, HostMetric>>,
-    global_write_avg: RwLock<RPCAverage>,
     global_read_avg: RwLock<RPCAverage>,
 }
 
@@ -63,9 +62,6 @@ impl Metrics {
         });
         if let Some(rate) = read {
             self.global_read_avg.write().unwrap().add_sample(rate);
-        }
-        if let Some(rate) = write {
-            self.global_write_avg.write().unwrap().add_sample(rate);
         }
     }
 
@@ -180,11 +176,6 @@ impl Client {
         };
         self.metrics
             .with_metric(host_key, |metric| metric.add_write_sample(transfer));
-        self.metrics
-            .global_write_avg
-            .write()
-            .unwrap()
-            .add_sample(transfer.rate());
     }
 
     /// Read equivalent of [`Self::record_write_sample`].
@@ -210,20 +201,6 @@ impl Client {
     #[cfg(test)]
     pub(crate) fn seed_read_sample(&self, host: PublicKey, size: u32, elapsed: Duration) {
         self.record_read_sample(host, size, elapsed);
-    }
-
-    /// Expected duration of a `bytes`-sized write on a typical host.
-    /// Falls back to a static until the first write is sampled.
-    pub fn write_estimate(&self, bytes: u32) -> Duration {
-        const DEFAULT: Transfer = Transfer::new(SECTOR_SIZE as u32, Duration::from_secs(5));
-        self.metrics
-            .global_write_avg
-            .read()
-            .unwrap()
-            .avg()
-            .and_then(|rate| rate.pace())
-            .map(|pace| pace.estimate_duration(bytes))
-            .unwrap_or_else(|| DEFAULT.estimate_duration(bytes))
     }
 
     /// Expected duration of a `bytes`-sized read on a typical host.

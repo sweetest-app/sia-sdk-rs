@@ -22,10 +22,6 @@ impl DialStats {
         *count += 1;
         *count
     }
-
-    pub(crate) fn dials(&self, address: &str) -> usize {
-        self.dials.get(address).copied().unwrap_or(0)
-    }
 }
 
 #[cfg(test)]
@@ -40,7 +36,7 @@ mod tests {
         assert_eq!(stats.note_dial("a:9984"), 2);
         assert_eq!(stats.note_dial("b:9984"), 1);
         assert_eq!(stats.note_dial("a:9984"), 3);
-        assert_eq!(stats.dials("a:9984"), 3);
-        assert_eq!(stats.dials("c:9984"), 0);
+        assert_eq!(stats.note_dial("a:9984"), 4, "the count keeps climbing");
+        assert_eq!(stats.note_dial("c:9984"), 1, "a new address starts at one");
     }
 }

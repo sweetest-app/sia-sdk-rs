@@ -192,7 +192,6 @@ mod imp {
             first.record_read_sample(host, 2048, Duration::from_secs(1));
             let same_pool = first_runtime.block_on(async { default_client() });
             assert!(Arc::ptr_eq(&first.metrics, &same_pool.metrics));
-            assert_eq!(same_pool.write_estimate(1024), Duration::from_secs(1));
             assert_eq!(same_pool.read_estimate(2048), Duration::from_secs(1));
             let other_pool = second_runtime.block_on(async { default_client() });
             assert!(!Arc::ptr_eq(&first.metrics, &other_pool.metrics));
@@ -202,7 +201,7 @@ mod imp {
             assert_eq!(
                 first_runtime
                     .block_on(async { default_client() })
-                    .write_estimate(1024),
+                    .read_estimate(2048),
                 Duration::from_secs(1)
             );
         }

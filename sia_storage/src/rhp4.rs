@@ -58,12 +58,16 @@ impl Client {
 
     /// Applies the connection limits to the transport that supports them.
     pub(crate) fn set_timeouts(&self, timeouts: crate::Timeouts) {
-        #[cfg(target_arch = "wasm32")]
-        if let Self::WebTransport(c) = self {
-            c.set_timeouts(timeouts);
+        match self {
+            #[cfg(target_arch = "wasm32")]
+            Self::WebTransport(c) => c.set_timeouts(timeouts),
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(_) => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::SiaMux(_) => {
+                let _ = timeouts;
+            }
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = timeouts;
     }
 
     /// Creates a client backed by the in-memory mock transport. Use
@@ -92,13 +96,14 @@ impl Client {
     /// others say true, which keeps a failed write a failure of the host rather
     /// than a session that was never tracked.
     pub(crate) fn is_connected(&self, host_key: &PublicKey) -> bool {
-        // Only the browser transport uses the key; the arm that does not is
-        // the whole function on other targets.
         let _ = host_key;
         match self {
             #[cfg(target_arch = "wasm32")]
             Self::WebTransport(c) => c.is_connected(host_key),
-            _ => true,
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(_) => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::SiaMux(_) => true,
         }
     }
 
@@ -107,7 +112,10 @@ impl Client {
         match self {
             #[cfg(target_arch = "wasm32")]
             Self::WebTransport(c) => c.handshake_time(host_key),
-            _ => None,
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(_) => None,
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::SiaMux(_) => None,
         }
     }
 
