@@ -198,6 +198,13 @@ impl WorkerState {
     }
 
     /// Stops every worker and returns the pinned slabs in order.
+    /// The slabs pinned so far, indexed by slab id. `None` is a slab that is
+    /// still filling or uploading, so a caller can tell what is finished
+    /// without stopping the upload.
+    pub(crate) fn pinned_slabs(&self) -> Vec<Option<Slab>> {
+        self.pinned.lock().unwrap().clone()
+    }
+
     pub(crate) fn shutdown(&self) -> Vec<Slab> {
         self.closed.store(true, Ordering::SeqCst);
         self.work.notify_waiters();

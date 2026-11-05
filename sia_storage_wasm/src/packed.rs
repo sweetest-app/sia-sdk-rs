@@ -117,11 +117,6 @@ impl PackedUpload {
 
     /// Finalizes the packed upload and returns the resulting objects.
     /// Each object must be pinned separately with `sdk.pinObject()`.
-    ///
-    /// Borrows instead of consuming `self`, so the handle stays alive and
-    /// [cancel](Self::cancel) can still be called while this future runs. The
-    /// core already races the work against the cancel token and drops the
-    /// upload when it fires, which aborts in-flight slab tasks.
     pub async fn finalize(&self) -> Result<Vec<PinnedObject>, JsError> {
         if self.cancel.is_cancelled() {
             return Err(JsError::new("upload closed"));
@@ -137,6 +132,33 @@ impl PackedUpload {
             } => r,
         };
         Ok(result?.into_iter().map(PinnedObject).collect())
+    }
+
+    /// The objects whose slabs have all pinned, indexed the same way
+    /// [add](Self::add) was called. `undefined` at an index means that object
+    /// still has a slab in flight.
+    ///
+    /// This is how a caller composes and pins files while the upload keeps
+    /// running, instead of waiting for [finalize](Self::finalize).
+    #[wasm_bindgen(js_name = "addedObjects")]
+    pub async fn added_objects(&self) -> Result<js_sys::Array, JsError> {
+        let inner = self.inner.clone();
+        let guard = inner.lock().await;
+        let Some(pu) = guard.as_ref() else {
+            return Err(JsError::new("upload closed"));
+        };
+        let array = js_sys::Array::new();
+        for ready in pu.ready_objects() {
+            match ready {
+                Some(object) => {
+                    array.push(&JsValue::from(PinnedObject(object)));
+                }
+                None => {
+                    array.push(&JsValue::UNDEFINED);
+                }
+            }
+        }
+        Ok(array)
     }
 
     /// Cancels the packed upload. Immediately interrupts any in-flight `add`

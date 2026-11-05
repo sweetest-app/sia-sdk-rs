@@ -499,6 +499,11 @@ impl Upload {
     pub(crate) fn optimal_data_size(&self) -> usize {
         self.slab_buffer.as_ref().unwrap().optimal_data_size()
     }
+
+    /// The slabs pinned so far, indexed by slab id.
+    pub(crate) fn pinned_slabs(&self) -> Vec<Option<Slab>> {
+        self.state.pinned_slabs()
+    }
 }
 
 struct ObjectUpload {
@@ -592,34 +597,73 @@ impl PackedUpload {
         self.objects
             .into_iter()
             .map(|upload| {
-                let mut object = upload.object;
                 if upload.start == upload.end {
                     // empty object: nothing to splice in, leave it with zero slabs
-                    return Ok(object);
+                    return Ok(upload.object);
                 }
                 let slabs_start = (upload.start / optimal_data_size) as usize;
                 let slabs_end = upload.end.div_ceil(optimal_data_size) as usize;
-                let n = slabs_end - slabs_start;
-                object
-                    .slabs
-                    .extend_from_slice(&uploaded_slabs[slabs_start..slabs_end]);
-
-                object.slabs[0].offset = (upload.start % optimal_data_size) as u32;
-                if object.slabs.len() > 1 {
-                    // if spanning multiple slabs, adjust first slab's length
-                    object.slabs[0].length =
-                        (optimal_data_size - object.slabs[0].offset as u64) as u32;
-                }
-                let last_slab_index = n - 1;
-                let last_slab_offset = object.slabs[last_slab_index].offset as u64;
-                object.slabs[last_slab_index].length =
-                    (upload.end - ((slabs_end as u64 - 1) * optimal_data_size) - last_slab_offset)
-                        as u32;
-
-                Ok(object)
+                Ok(splice(
+                    &upload.object,
+                    upload.start,
+                    upload.end,
+                    &uploaded_slabs[slabs_start..slabs_end],
+                    optimal_data_size,
+                ))
             })
             .collect()
     }
+
+    /// The objects whose slabs have all pinned, indexed the same way
+    /// [add](Self::add) was called. `None` means that object still has a slab
+    /// in flight, so a caller can compose and pin finished files while the
+    /// upload keeps running instead of waiting for
+    /// [finalize](Self::finalize).
+    pub fn ready_objects(&self) -> Vec<Option<Object>> {
+        let pinned = self.upload.pinned_slabs();
+        let optimal_data_size = self.optimal_data_size() as u64;
+        self.objects
+            .iter()
+            .map(|upload| {
+                if upload.start == upload.end {
+                    return Some(upload.object.clone());
+                }
+                let slabs_start = (upload.start / optimal_data_size) as usize;
+                let slabs_end = upload.end.div_ceil(optimal_data_size) as usize;
+                let slabs: Vec<Slab> = pinned
+                    .get(slabs_start..slabs_end)?
+                    .iter()
+                    .map(|slab| slab.clone())
+                    .collect::<Option<Vec<_>>>()?;
+                Some(splice(
+                    &upload.object,
+                    upload.start,
+                    upload.end,
+                    &slabs,
+                    optimal_data_size,
+                ))
+            })
+            .collect()
+    }
+}
+
+/// Gives `object` the slabs its byte range covers, trimming the first and last
+/// to the range. Shared by [`PackedUpload::finalize`] and
+/// [`PackedUpload::ready_objects`] so the two cannot disagree.
+fn splice(object: &Object, start: u64, end: u64, slabs: &[Slab], optimal: u64) -> Object {
+    let mut object = object.clone();
+    let count = slabs.len();
+    object.slabs.extend_from_slice(slabs);
+    object.slabs[0].offset = (start % optimal) as u32;
+    if count > 1 {
+        // if spanning multiple slabs, adjust first slab's length
+        object.slabs[0].length = (optimal - object.slabs[0].offset as u64) as u32;
+    }
+    let last = count - 1;
+    let last_offset = object.slabs[last].offset as u64;
+    object.slabs[last].length =
+        (end - ((count as u64 - 1) * optimal) - last_offset) as u32;
+    object
 }
 
 /// Reads until EOF and uploads all slabs. The data will be erasure coded,
