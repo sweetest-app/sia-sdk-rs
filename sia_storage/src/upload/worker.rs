@@ -360,12 +360,13 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
                         limit: 0,
                     });
                 }
+                // The pool logs the ban itself, with the counts it owns. One
+                // line per ban keeps the log readable and the count honest.
                 state.pool.lock().unwrap().leave(host, LeaveReason::Failed(reason));
                 state.queue.lock().unwrap().failed(request);
                 debug!(
-                    "[pool] banned {}: {} ({})",
+                    "[pool] {} left: {}",
                     short(&host),
-                    reason.as_str(),
                     state.pool.lock().unwrap().describe(),
                 );
                 state.work.notify_waiters();
