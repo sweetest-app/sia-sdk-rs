@@ -661,8 +661,11 @@ fn splice(object: &Object, start: u64, end: u64, slabs: &[Slab], optimal: u64) -
     }
     let last = count - 1;
     let last_offset = object.slabs[last].offset as u64;
-    object.slabs[last].length =
-        (end - ((count as u64 - 1) * optimal) - last_offset) as u32;
+    // Start of the slab that holds the last byte. Using the object's own slab
+    // count here instead would be right only for an object that begins in slab
+    // zero, and made every later object hundreds of megabytes too long.
+    let last_slab_start = (end - 1) / optimal * optimal;
+    object.slabs[last].length = (end - last_slab_start - last_offset) as u32;
     object
 }
 
@@ -796,6 +799,26 @@ mod tests {
             offset: 0,
             length: 1,
         }
+    }
+
+    #[sia_core_derive::cross_target_test]
+    fn test_splice_sizes_an_object_that_starts_inside_a_later_slab() {
+        // One slab per upload meant every object started at slab 0, so the
+        // subtraction that sizes the last slab was accidentally right. In a
+        // packed batch the second object can start in the middle of a later
+        // slab, and then the object's own slab count is not the slab's offset.
+        let optimal = 40 * 1024 * 1024u64;
+        let mib = 1024 * 1024u64;
+        let mut slab = test_slab();
+        slab.min_shards = 10;
+        slab.length = optimal as u32;
+
+        // A 10 MiB object sitting 50 MiB into the upload, so 10 MiB into slab 1.
+        let object = splice(&Object::default(), 50 * mib, 60 * mib, &[slab], optimal);
+        assert_eq!(object.slabs.len(), 1);
+        assert_eq!(object.slabs[0].offset, 10 * mib as u32, "10 MiB into its slab");
+        assert_eq!(object.slabs[0].length, 10 * mib as u32, "and 10 MiB long");
+        assert_eq!(object.size(), 10 * mib, "so the object is 10 MiB, not 60");
     }
 
     #[sia_core_derive::cross_target_test]
