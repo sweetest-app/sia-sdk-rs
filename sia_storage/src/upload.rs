@@ -520,6 +520,13 @@ struct ObjectUpload {
 pub struct PackedUpload {
     upload: Upload,
     objects: Vec<ObjectUpload>,
+    /// One data key for every object in the upload.
+    ///
+    /// An object made of several of these slabs has to decrypt with one key,
+    /// and a caller composing a file that spans slabs takes the key from one
+    /// object and the slabs from all of them. Separate keys per added object
+    /// would leave every slab after the first undecryptable.
+    data_key: EncryptionKey,
 }
 
 impl PackedUpload {
@@ -532,6 +539,7 @@ impl PackedUpload {
         Ok(Self {
             upload: Upload::new(client, api_client, app_key, options.into())?,
             objects: Vec::new(),
+            data_key: EncryptionKey::from(rand::random::<[u8; 32]>()),
         })
     }
 
@@ -571,7 +579,8 @@ impl PackedUpload {
     /// stay in the slab as padding, counted in [length](Self::length) and
     /// [remaining](Self::remaining).
     pub async fn add<R: AsyncRead + Unpin>(&mut self, r: R) -> Result<u64, UploadError> {
-        let object = Object::default();
+        let mut object = Object::new(None);
+        object.data_key = self.data_key.clone();
         let start = self.upload.length();
         let n = self.upload.read(object.data_key.clone(), r).await?;
         let end = self.upload.length();
