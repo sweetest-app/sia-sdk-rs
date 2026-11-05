@@ -108,47 +108,42 @@ impl UploadLimiter {
     /// to the workers that have waited longest.
     fn record(self: &Arc<Self>, permit: SamplePermit, elapsed: Duration, ok: bool) {
         let delta = self.controller.record(permit, elapsed, ok);
-        self.grant(delta.max(0) as usize);
+        if delta > 0 {
+            let mut state = self.state.lock().unwrap();
+            self.hand_out(&mut state);
+        }
     }
 
-    /// Hands the slot this worker was holding to the front of the queue, or
-    /// gives it back to the controller when nobody is waiting.
+    /// Gives the slot this worker was holding back, then serves the line.
     fn release(self: &Arc<Self>) {
         let mut state = self.state.lock().unwrap();
-        while let Some(tx) = state.waiters.pop_front() {
-            match tx.send(UploadPermit {
-                limiter: Arc::clone(self),
-            }) {
-                Ok(()) => return,
-                // That worker gave up while we were handing it the slot. The
-                // permit in the `Err` would drop and re-enter this function
-                // holding the lock, so it is forgotten and the slot stays
-                // counted while the next waiter is offered it.
-                Err(permit) => std::mem::forget(permit),
-            }
-        }
         state.inflight -= 1;
+        self.hand_out(&mut state);
     }
 
-    /// Grows the budget by `count` and gives what grew to parked workers.
-    fn grant(self: &Arc<Self>, count: usize) {
-        if count == 0 {
-            return;
-        }
-        let mut state = self.state.lock().unwrap();
-        state.inflight += count;
-        let mut handed = 0;
-        while handed < count {
+    /// Serves parked workers while the gate has room.
+    ///
+    /// `inflight` counts permits that exist, so the room is always
+    /// `limit - inflight`. Counting a grown limit as extra `inflight` instead
+    /// would leave the counter above the limit after the controller backs off,
+    /// and the gate would never open again. Transfers are not used either: a
+    /// permit is only handed over while there is real room, so a shrink takes
+    /// effect on the next release.
+    fn hand_out(self: &Arc<Self>, state: &mut LimiterState) {
+        while state.inflight < self.controller.limit() {
             let Some(tx) = state.waiters.pop_front() else {
                 break;
             };
+            state.inflight += 1;
             match tx.send(UploadPermit {
                 limiter: Arc::clone(self),
             }) {
-                Ok(()) => handed += 1,
+                Ok(()) => {}
                 Err(permit) => {
-                    // Same as `release`: give the slot back and try the next
-                    // worker, without dropping the permit under the lock.
+                    // That worker gave up while we were handing it the slot.
+                    // The permit in the `Err` would drop and re-enter
+                    // `release` holding this lock, so it is forgotten and the
+                    // slot given back before the next worker is offered it.
                     std::mem::forget(permit);
                     state.inflight -= 1;
                 }
@@ -874,6 +869,53 @@ mod tests {
             "and it is given one as soon as a permit frees up"
         );
         drop(second);
+    }
+
+    /// A gate that shrinks after growing must still admit the next worker.
+    ///
+    /// The controller raises the limit when writes go well and halves it when
+    /// the link sours. If a growth is counted as if the new room were already
+    /// in use, a later shrink leaves the counter above the limit, and the gate
+    /// never opens again: every worker parks waiting for a slot the counter
+    /// says is taken. Nothing in the log says why.
+    #[sia_core_derive::cross_target_test]
+    async fn test_a_shrunk_write_gate_still_admits_the_next_worker() {
+        use std::task::{Context, Poll, Waker};
+
+        let limiter = Arc::new(UploadLimiter::new(2, 1, 30));
+        let mut held = Some(limiter.acquire().await);
+
+        // Good writes first, with nobody waiting, so the limit climbs.
+        let mut grew = false;
+        for _ in 0..200 {
+            let sample = limiter.sample();
+            limiter.record(sample, Duration::from_millis(20), true);
+            if limiter.controller.limit() > 2 {
+                grew = true;
+                break;
+            }
+        }
+        assert!(grew, "the controller must climb on good completions");
+
+        // Then the link sours and the controller backs all the way down.
+        for _ in 0..200 {
+            if limiter.controller.limit() <= 1 {
+                break;
+            }
+            let sample = limiter.sample();
+            limiter.record(sample, Duration::from_secs(5), false);
+        }
+        assert_eq!(limiter.controller.limit(), 1, "one write at a time now");
+
+        // One write is running. Stop it, and the one slot the gate allows must
+        // be usable again.
+        drop(held.take());
+        let mut next = Box::pin(limiter.acquire());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            matches!(next.as_mut().poll(&mut cx), Poll::Ready(_)),
+            "the slot the gate allows must not be counted as already taken",
+        );
     }
 
     #[sia_core_derive::cross_target_test]
