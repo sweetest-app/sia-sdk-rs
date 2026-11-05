@@ -767,6 +767,10 @@ mod test {
         assert_eq!(objects[0].slabs().len(), 1);
         assert_eq!(objects[1].slabs().len(), 1);
 
+        // One key for the upload, because a caller composing a file out of
+        // slabs from several added objects decrypts all of them with it.
+        assert_eq!(objects[0].data_key, objects[1].data_key);
+
         // obj 0 should be the first 13 bytes
         assert_eq!(objects[0].slabs()[0].offset, 0);
         assert_eq!(objects[0].size(), 13);
