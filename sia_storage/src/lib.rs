@@ -117,13 +117,12 @@ pub type AppID = Hash256;
 /// Override them with [`Builder::set_timeouts`] before connecting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
-    /// Opening a WebTransport session to one address.
+    /// The allowance a WebTransport dial gets once it is its turn.
     ///
-    /// Ten seconds. An idle link opens a session in about 1.7 seconds, so six
-    /// was enough on its own, but a link already carrying a slab makes the same
-    /// handshake take eight or nine and six then failed hosts that would have
-    /// worked. The cap still costs about a third less than the original fifteen
-    /// per silent host, which is what makes host discovery affordable.
+    /// Ten seconds. It is not a total: the time a dial spends waiting in the
+    /// browser's queue is not charged against it, because a dial that is waiting
+    /// has not failed. The clock starts when nothing of ours is ahead of the dial
+    /// and the browser has had one gap to start it, so only silence costs this.
     pub connect: Duration,
     /// One RPC, from stream open to the last byte.
     pub transfer: Duration,

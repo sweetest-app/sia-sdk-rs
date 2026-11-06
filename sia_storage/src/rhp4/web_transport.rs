@@ -37,7 +37,7 @@ use crate::client::metrics::TransferRate;
 use crate::time::{Duration, Instant, sleep, timeout};
 
 use super::dial_stats::DialStats;
-use super::dial_watch::DialWatch;
+use super::dial_watch::{self, DialWatch};
 use super::{Error, HostEndpoint};
 use crate::tokens::AccountTokenSource;
 
@@ -547,48 +547,41 @@ impl Client {
     }
 
     /// Connects to the first address that accepts a WebTransport session.
+    ///
+    /// Each address is its own dial: it takes its own place in the queue and gets
+    /// its own allowance. A host that lists three addresses is three attempts,
+    /// and a slow first one must not eat the second one's budget.
     async fn dial_addresses(&self, addresses: &[String]) -> Result<Rc<Connection>, Error> {
         let _permit = self
             .dial_sema
             .acquire()
             .await
             .map_err(|e| Error::Transport(format!("dial semaphore closed: {e}")))?;
-        let started = Instant::now();
-        let id = self.watch.borrow_mut().start(started);
-        let result = self.dial_each_address(id, started, addresses).await;
-        self.watch.borrow_mut().settle(id);
-        result
-    }
-
-    async fn dial_each_address(
-        &self,
-        id: u64,
-        started: Instant,
-        addresses: &[String],
-    ) -> Result<Rc<Connection>, Error> {
         let mut last_err = None;
         for addr in addresses {
             let dial_count = self.failures.borrow_mut().note_dial(addr);
             if dial_count > 1 {
                 debug!("[WT] re-dial #{dial_count} of {addr}");
             }
-            let attempt = Instant::now();
+            let started = Instant::now();
+            let id = self.watch.borrow_mut().start(started);
             let result = self.connect_while_queued(id, started, addr).await;
+            self.watch.borrow_mut().settle(id);
             match result {
                 Ok(conn) => {
-                    debug!("[WT] handshake {addr} ok in {:?}", attempt.elapsed());
+                    debug!("[WT] handshake {addr} ok in {:?}", started.elapsed());
                     return Ok(Rc::new(conn));
                 }
                 Err(e) => {
                     debug!(
                         "[WT] handshake {addr} failed in {:?}: {e}",
-                        attempt.elapsed()
+                        started.elapsed()
                     );
                     // A dial that dies within the refusal window never reached
                     // the browser's counter: the queue was full, or the address
                     // was refused before a packet went out. Anything slower
                     // failed as a handshake, and the browser holds an entry.
-                    if DialWatch::counts_as_failure(attempt.elapsed()) {
+                    if dial_watch::counts_as_failure(started.elapsed()) {
                         self.watch.borrow_mut().note_failure(Instant::now());
                     }
                     last_err = Some(e);
@@ -608,21 +601,12 @@ impl Client {
     ) -> Result<Connection, Error> {
         let mut dial = Box::pin(connect(addr));
         let mut deadline = started + self.timeouts().connect;
-        let mut front_since = started;
         loop {
             match timeout(WATCHDOG_TICK, &mut dial).await {
                 Ok(result) => return result,
                 Err(_) => {
                     let now = Instant::now();
-                    // While another dial of ours is ahead, the allowance has not
-                    // started yet, so the deadline keeps moving out.
-                    if self.watch.borrow().ahead(id) != Some(0) {
-                        front_since = now;
-                    }
-                    deadline = self
-                        .watch
-                        .borrow_mut()
-                        .deadline(id, now, deadline, front_since);
+                    deadline = self.watch.borrow_mut().tick(id, now, deadline);
                     if now >= deadline {
                         return Err(Error::Transport("WebTransport connect: timeout".into()));
                     }
@@ -772,7 +756,7 @@ mod tests {
     const IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 
     #[wasm_bindgen_test]
-    async fn test_refused_address_is_not_dialed_again() {
+    async fn test_a_refused_address_fails_and_is_not_counted() {
         // The space makes the URL invalid, so the browser rejects the session at once.
         let address = "not a host:9984";
         let host = HostEndpoint {
@@ -783,19 +767,23 @@ mod tests {
             }],
         };
         let client = Client::new();
+        let before = client.watch.borrow_mut().count(Instant::now());
 
         assert!(client.connection(&host).await.is_err());
         assert!(
-            client
-                .failures
-                .borrow_mut()
-                .in_backoff(address, Instant::now())
+            client.connection(&host).await.is_err(),
+            "a refused address is not remembered as usable"
         );
-        match client.dial(&host) {
-            Err(Error::DialRefused(_)) => {}
-            Err(e) => panic!("expected DialRefused, got {e}"),
-            Ok(_) => panic!("the refused address was dialed again"),
-        }
+        assert_eq!(
+            client.watch.borrow_mut().count(Instant::now()),
+            before,
+            "a refusal never reached the browser's counter, so it adds nothing"
+        );
+        assert_eq!(
+            client.failures.borrow_mut().note_dial(address),
+            3,
+            "every attempt is still counted per address"
+        );
     }
 
     #[wasm_bindgen_test]

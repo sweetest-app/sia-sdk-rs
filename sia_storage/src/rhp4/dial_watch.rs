@@ -31,11 +31,18 @@ const CAP_ENTRIES: usize = 14;
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) const REFUSAL_WINDOW: Duration = Duration::from_millis(25);
 
+struct Dial {
+    id: u64,
+    /// The first tick at which nothing of ours was ahead of this dial. The
+    /// allowance starts here, and never earlier.
+    front_since: Option<Instant>,
+}
+
 /// The dials in flight, the failures the browser still remembers, and the
 /// allowance a dial gets once it is at the front.
 pub(crate) struct DialWatch {
     failures: VecDeque<Instant>,
-    dials: VecDeque<u64>,
+    dials: VecDeque<Dial>,
     next_id: u64,
     handshake: Duration,
 }
@@ -61,12 +68,15 @@ impl DialWatch {
         self.prune(now);
         let id = self.next_id;
         self.next_id += 1;
-        self.dials.push_back(id);
+        self.dials.push_back(Dial {
+            id,
+            front_since: None,
+        });
         id
     }
 
     pub(crate) fn settle(&mut self, id: u64) {
-        self.dials.retain(|dial| *dial != id);
+        self.dials.retain(|dial| dial.id != id);
     }
 
     /// Notes a failure the browser counts. A refusal does not come here.
@@ -78,7 +88,7 @@ impl DialWatch {
     /// How many dials of ours, this one included, are still unsettled in front
     /// of it. `None` once the dial has settled.
     pub(crate) fn ahead(&self, id: u64) -> Option<usize> {
-        self.dials.iter().position(|dial| *dial == id)
+        self.dials.iter().position(|dial| dial.id == id)
     }
 
     /// Every dial the browser is holding, ours and the failures it remembers.
@@ -98,45 +108,28 @@ impl DialWatch {
         Duration::from_millis((gap_ms * JITTER) as u64)
     }
 
-    /// The moment this dial is given up on. `previous` is the deadline it had
-    /// last, and `front_since` is when it last had another dial ahead of it, or
-    /// when it started.
+    /// Recomputes this dial's deadline. `previous` is the deadline it had last,
+    /// and the result only ever moves later.
     ///
-    /// The deadline only ever moves later. While something is ahead, the
-    /// estimate is pushed out by a whole gap, and a gap is never zero, so a dial
-    /// that is waiting cannot be killed.
-    ///
-    /// Being at the front of our own dials is not the same as being started:
-    /// Chromium waits one gap before it starts the next request even when
-    /// nothing else of ours is queued, because the gap is set by the failures it
-    /// remembers. So the front dial also gets one whole gap before its allowance
-    /// begins, and that gap is read from the window as it stands.
-    pub(crate) fn deadline(
-        &mut self,
-        id: u64,
-        now: Instant,
-        previous: Instant,
-        front_since: Instant,
-    ) -> Instant {
-        match self.ahead(id) {
-            Some(0) => previous.max(front_since + self.gap(now) + self.handshake),
-            Some(ahead) => {
-                let wait = self.gap(now).mul_f64(ahead as f64);
-                previous.max(now + wait + self.handshake)
+    /// While a dial of ours is ahead, the estimate is pushed out by a whole gap
+    /// for each of them, so a dial that is waiting cannot be killed. The first
+    /// tick with nothing ahead is recorded as `front_since`: from there the dial
+    /// gets one gap for its own turn and then the allowance, so waiting stops
+    /// buying time and only silence can end it.
+    pub(crate) fn tick(&mut self, id: u64, now: Instant, previous: Instant) -> Instant {
+        let gap = self.gap(now);
+        let ahead = self.ahead(id);
+        match ahead {
+            Some(0) => {
+                let front_since = match self.dials.iter_mut().find(|dial| dial.id == id) {
+                    Some(dial) => *dial.front_since.get_or_insert(now),
+                    None => now,
+                };
+                previous.max(front_since + gap + self.handshake)
             }
+            Some(ahead) => previous.max(now + gap.mul_f64(ahead as f64) + self.handshake),
             None => previous,
         }
-    }
-
-    /// Whether a failed attempt is a failure the browser counts.
-    ///
-    /// A dial that dies within [`REFUSAL_WINDOW`] was refused before a packet
-    /// went out: the queue was full, or the address was refused outright. The
-    /// browser counts nothing for those, so neither do we. Anything slower failed
-    /// as a handshake, and the browser is holding an entry for it.
-    #[cfg(any(target_arch = "wasm32", test))]
-    pub(crate) fn counts_as_failure(elapsed: Duration) -> bool {
-        elapsed > REFUSAL_WINDOW
     }
 
     fn prune(&mut self, now: Instant) {
@@ -147,6 +140,17 @@ impl DialWatch {
             self.failures.pop_front();
         }
     }
+}
+
+/// Whether a failed attempt is a failure the browser counts.
+///
+/// A dial that dies within [`REFUSAL_WINDOW`] was refused before a packet went
+/// out: the queue was full, or the address was refused outright. The browser
+/// counts nothing for those, so neither do we. Anything slower failed as a
+/// handshake, and the browser is holding an entry for it.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn counts_as_failure(elapsed: Duration) -> bool {
+    elapsed > REFUSAL_WINDOW
 }
 
 #[cfg(test)]
@@ -195,11 +199,11 @@ mod tests {
         let now = Instant::now();
         let mut watch = holding(8, now);
         let mine = watch.start(now);
-        let first = watch.deadline(mine, now, now, now);
+        let first = watch.tick(mine, now, now);
 
-        watch.settle(*watch.dials.front().unwrap());
+        watch.settle(*watch.ids().first().unwrap());
         let later = now + Duration::from_secs(1);
-        let second = watch.deadline(mine, later, first, later);
+        let second = watch.tick(mine, later, first);
         assert!(second >= first, "a better position never pulls it back");
     }
 
@@ -216,60 +220,46 @@ mod tests {
         // Ten minutes of waiting later, still not killed: the estimate pushes
         // out by a whole gap for each dial ahead, and the window is full.
         let much_later = now + Duration::from_secs(600);
-        let deadline = watch.deadline(mine, much_later, now, now);
+        let deadline = watch.tick(mine, much_later, now);
         assert!(deadline > much_later, "the deadline is still in the future");
     }
 
     #[test]
-    fn the_front_dial_still_waits_a_gap_before_its_allowance() {
+    fn the_front_dial_waits_a_gap_then_its_allowance_from_the_moment_it_is_seen() {
         let now = Instant::now();
         let mut watch = holding(1, now);
-        let mine = *watch.dials.front().unwrap();
+        let front = *watch.ids().first().unwrap();
+        let mine = watch.start(now);
         for _ in 0..12 {
             watch.note_failure(now);
         }
-        let gap = watch.gap(now);
-        assert!(
-            gap >= Duration::from_secs(20),
-            "twelve failures mean a long gap, got {gap:?}"
-        );
 
-        let deadline = watch.deadline(mine, now, now, now);
-        assert_eq!(
-            deadline,
-            now + gap + Duration::from_secs(10),
-            "the front dial cannot be killed before the gap plus its allowance"
+        // Still behind the first dial: no allowance has started.
+        let behind = watch.tick(mine, now, now);
+        assert!(behind > now);
+
+        // The front dial settles, and this tick is the first with nothing ahead.
+        watch.settle(front);
+        let seen_at = now + Duration::from_secs(2);
+        let deadline = watch.tick(mine, seen_at, behind);
+        // One gap for its own turn, then the allowance, all counted from the tick
+        // it was first seen with nothing ahead. The earlier estimate is larger
+        // here because the window was fuller before the front dial settled, so
+        // the deadline only has to be at least that.
+        let gap = watch.gap(seen_at);
+        assert!(
+            deadline >= seen_at + gap + Duration::from_secs(10),
+            "one gap for its turn, then ten seconds of silence, from the tick it was seen at the front"
         );
+        assert!(deadline >= behind, "and never earlier than the estimate before it");
     }
 
     #[test]
     fn a_refusal_is_not_a_counted_failure_but_a_slow_failure_is() {
-        assert!(!DialWatch::counts_as_failure(Duration::from_millis(1)));
-        assert!(!DialWatch::counts_as_failure(REFUSAL_WINDOW));
-        assert!(DialWatch::counts_as_failure(Duration::from_millis(26)));
-        assert!(DialWatch::counts_as_failure(Duration::from_secs(10)));
-    }
-
-    #[test]
-    fn at_the_front_the_allowance_runs_from_that_moment() {
-        let now = Instant::now();
-        let mut watch = holding(3, now);
-        let mine = watch.start(now);
-        for id in watch.dials.iter().copied().collect::<Vec<_>>() {
-            if id != mine {
-                watch.settle(id);
-            }
-        }
-        assert_eq!(watch.ahead(mine), Some(0));
-
-        let alone_at = now + Duration::from_secs(4);
-        let gap = watch.gap(alone_at);
-        let deadline = watch.deadline(mine, alone_at, now, alone_at);
-        assert_eq!(
-            deadline,
-            alone_at + gap + Duration::from_secs(10),
-            "one gap for its turn, then ten seconds of silence"
-        );
+        assert!(!counts_as_failure(Duration::from_millis(1)));
+        assert!(!counts_as_failure(REFUSAL_WINDOW));
+        assert!(counts_as_failure(Duration::from_millis(26)));
+        assert!(counts_as_failure(Duration::from_secs(10)));
     }
 
     /// A watch with this many dials started and no failures.
@@ -279,5 +269,11 @@ mod tests {
             watch.start(now);
         }
         watch
+    }
+
+    impl DialWatch {
+        fn ids(&self) -> Vec<u64> {
+            self.dials.iter().map(|dial| dial.id).collect()
+        }
     }
 }
