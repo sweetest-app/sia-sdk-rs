@@ -28,7 +28,7 @@ const JITTER: f64 = 1.5;
 const CAP_ENTRIES: usize = 14;
 /// A dial that fails in less than this was refused before the browser counted
 /// anything: a full queue, or an address it would not dial. It adds nothing.
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) const REFUSAL_WINDOW: Duration = Duration::from_millis(25);
 
 /// The dials in flight, the failures the browser still remembers, and the
@@ -104,9 +104,13 @@ impl DialWatch {
     ///
     /// The deadline only ever moves later. While something is ahead, the
     /// estimate is pushed out by a whole gap, and a gap is never zero, so a dial
-    /// that is waiting cannot be killed. Once nothing is ahead, the deadline is
-    /// fixed at the allowance after `front_since`: from there waiting stops
-    /// buying time and only silence can end it.
+    /// that is waiting cannot be killed.
+    ///
+    /// Being at the front of our own dials is not the same as being started:
+    /// Chromium waits one gap before it starts the next request even when
+    /// nothing else of ours is queued, because the gap is set by the failures it
+    /// remembers. So the front dial also gets one whole gap before its allowance
+    /// begins, and that gap is read from the window as it stands.
     pub(crate) fn deadline(
         &mut self,
         id: u64,
@@ -115,13 +119,24 @@ impl DialWatch {
         front_since: Instant,
     ) -> Instant {
         match self.ahead(id) {
-            Some(0) => previous.max(front_since + self.handshake),
+            Some(0) => previous.max(front_since + self.gap(now) + self.handshake),
             Some(ahead) => {
                 let wait = self.gap(now).mul_f64(ahead as f64);
                 previous.max(now + wait + self.handshake)
             }
             None => previous,
         }
+    }
+
+    /// Whether a failed attempt is a failure the browser counts.
+    ///
+    /// A dial that dies within [`REFUSAL_WINDOW`] was refused before a packet
+    /// went out: the queue was full, or the address was refused outright. The
+    /// browser counts nothing for those, so neither do we. Anything slower failed
+    /// as a handshake, and the browser is holding an entry for it.
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) fn counts_as_failure(elapsed: Duration) -> bool {
+        elapsed > REFUSAL_WINDOW
     }
 
     fn prune(&mut self, now: Instant) {
@@ -192,14 +207,47 @@ mod tests {
     fn a_dial_with_someone_ahead_cannot_be_killed() {
         let now = Instant::now();
         let mut watch = holding(6, now);
+        for _ in 0..8 {
+            watch.note_failure(now);
+        }
         let mine = watch.start(now);
         assert_eq!(watch.ahead(mine), Some(6));
 
-        // Ten minutes of waiting later, still not killed: the estimate moves out
-        // by a whole gap for each dial ahead.
+        // Ten minutes of waiting later, still not killed: the estimate pushes
+        // out by a whole gap for each dial ahead, and the window is full.
         let much_later = now + Duration::from_secs(600);
         let deadline = watch.deadline(mine, much_later, now, now);
         assert!(deadline > much_later, "the deadline is still in the future");
+    }
+
+    #[test]
+    fn the_front_dial_still_waits_a_gap_before_its_allowance() {
+        let now = Instant::now();
+        let mut watch = holding(1, now);
+        let mine = *watch.dials.front().unwrap();
+        for _ in 0..12 {
+            watch.note_failure(now);
+        }
+        let gap = watch.gap(now);
+        assert!(
+            gap >= Duration::from_secs(20),
+            "twelve failures mean a long gap, got {gap:?}"
+        );
+
+        let deadline = watch.deadline(mine, now, now, now);
+        assert_eq!(
+            deadline,
+            now + gap + Duration::from_secs(10),
+            "the front dial cannot be killed before the gap plus its allowance"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_not_a_counted_failure_but_a_slow_failure_is() {
+        assert!(!DialWatch::counts_as_failure(Duration::from_millis(1)));
+        assert!(!DialWatch::counts_as_failure(REFUSAL_WINDOW));
+        assert!(DialWatch::counts_as_failure(Duration::from_millis(26)));
+        assert!(DialWatch::counts_as_failure(Duration::from_secs(10)));
     }
 
     #[test]
@@ -215,11 +263,12 @@ mod tests {
         assert_eq!(watch.ahead(mine), Some(0));
 
         let alone_at = now + Duration::from_secs(4);
+        let gap = watch.gap(alone_at);
         let deadline = watch.deadline(mine, alone_at, now, alone_at);
         assert_eq!(
             deadline,
-            alone_at + Duration::from_secs(10),
-            "ten seconds of silence from the moment nothing was ahead"
+            alone_at + gap + Duration::from_secs(10),
+            "one gap for its turn, then ten seconds of silence"
         );
     }
 

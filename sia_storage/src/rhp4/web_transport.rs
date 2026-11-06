@@ -37,7 +37,7 @@ use crate::client::metrics::TransferRate;
 use crate::time::{Duration, Instant, sleep, timeout};
 
 use super::dial_stats::DialStats;
-use super::dial_watch::{DialWatch, REFUSAL_WINDOW};
+use super::dial_watch::DialWatch;
 use super::{Error, HostEndpoint};
 use crate::tokens::AccountTokenSource;
 
@@ -584,11 +584,11 @@ impl Client {
                         "[WT] handshake {addr} failed in {:?}: {e}",
                         attempt.elapsed()
                     );
-                    // A dial that dies this fast never reached the browser's
-                    // counter: the queue was full, or the address was refused
-                    // before a packet went out. Anything slower failed as a
-                    // handshake, and the browser is holding an entry for it.
-                    if attempt.elapsed() >= REFUSAL_WINDOW {
+                    // A dial that dies within the refusal window never reached
+                    // the browser's counter: the queue was full, or the address
+                    // was refused before a packet went out. Anything slower
+                    // failed as a handshake, and the browser holds an entry.
+                    if DialWatch::counts_as_failure(attempt.elapsed()) {
                         self.watch.borrow_mut().note_failure(Instant::now());
                     }
                     last_err = Some(e);
