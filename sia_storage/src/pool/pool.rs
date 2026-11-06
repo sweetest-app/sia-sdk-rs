@@ -31,7 +31,7 @@ pub(crate) struct HostPool<V: HostView> {
     banned: SharedBans,
     connected: HashSet<PublicKey>,
     /// Candidates whose dial is in flight. Reserved so two callers cannot dial
-    /// the same host, and released by `settle` or `cancel_dial`.
+    /// the same host, and released by `settle` or `release`.
     dialling: HashSet<PublicKey>,
     target: usize,
     /// Dials the pool has started, and how many of those opened a session.
@@ -86,11 +86,6 @@ impl<V: HostView> HostPool<V> {
     }
 
     #[cfg(test)]
-    pub(crate) fn is_connected(&self, host: &PublicKey) -> bool {
-        self.connected.contains(host)
-    }
-
-    #[cfg(test)]
     pub(crate) fn is_banned(&self, host: &PublicKey) -> bool {
         self.banned.contains(host)
     }
@@ -104,8 +99,8 @@ impl<V: HostView> HostPool<V> {
     /// Every host returned is marked as dialling, so the caller must finish it
     /// with [`HostPool::settle`] or [`HostPool::cancel_dial`].
     pub(crate) fn plan(&mut self) -> Vec<PublicKey> {
-        let short = self.target.saturating_sub(self.connected.len() + self.dialling.len());
-        if short == 0 {
+        let shortfall = self.target.saturating_sub(self.connected.len() + self.dialling.len());
+        if shortfall == 0 {
             return Vec::new();
         }
         let mut ranked: Vec<(f64, PublicKey)> = self
@@ -119,44 +114,24 @@ impl<V: HostView> HostPool<V> {
             .map(|host| (self.score(host), *host))
             .collect();
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let chosen: Vec<PublicKey> = ranked.into_iter().take(short).map(|(_, host)| host).collect();
+        let chosen: Vec<PublicKey> = ranked
+            .into_iter()
+            .take(shortfall)
+            .map(|(_, host)| host)
+            .collect();
         for host in &chosen {
             self.dialling.insert(*host);
             self.attempts += 1;
             self.per_host.entry(*host).or_default().attempts += 1;
+            debug!("[pool] mark {}, {} dialling", short(host), self.dialling.len());
         }
         chosen
     }
 
-    /// Hosts to dial beyond the target.
-    ///
-    /// The target is a steady state, not a ceiling. When every connected host
-    /// has already served the slab that still has shards left, the only way to
-    /// place them is a host that has not, which means one more than the pool was
-    /// aiming for. The caller decides when that is the case, so this stays a
-    /// plain request.
-    pub(crate) fn plan_extra(&mut self, count: usize) -> Vec<PublicKey> {
-        if count == 0 {
-            return Vec::new();
-        }
-        let mut ranked: Vec<(f64, PublicKey)> = self
-            .candidates
-            .iter()
-            .filter(|host| {
-                !self.banned.contains(host)
-                    && !self.connected.contains(host)
-                    && !self.dialling.contains(host)
-            })
-            .map(|host| (self.score(host), *host))
-            .collect();
-        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let chosen: Vec<PublicKey> = ranked.into_iter().take(count).map(|(_, host)| host).collect();
-        for host in &chosen {
-            self.dialling.insert(*host);
-            self.attempts += 1;
-            self.per_host.entry(*host).or_default().attempts += 1;
-        }
-        chosen
+    /// Dials the pool has asked for and not settled yet. They may be waiting for
+    /// a permit in the transport, so this is not the number of open handshakes.
+    pub(crate) fn dialling(&self) -> usize {
+        self.dialling.len()
     }
 
     /// Records the outcome of a planned dial. `None` means a session opened;
@@ -188,9 +163,10 @@ impl<V: HostView> HostPool<V> {
 
     /// Releases a reservation without judging the host, for a dial that was
     /// abandoned before it finished.
-    #[cfg(test)]
-    pub(crate) fn cancel_dial(&mut self, host: PublicKey) {
-        self.dialling.remove(&host);
+    pub(crate) fn release(&mut self, host: PublicKey) {
+        if self.dialling.remove(&host) {
+            debug!("[pool] release {}, {} dialling", short(&host), self.dialling.len());
+        }
     }
 
     /// A worker left. A closed session puts the host back in the running; a
@@ -494,7 +470,7 @@ mod tests {
         let list = keys(1);
         let mut pool = HostPool::new(FakeView::new(), list.clone(), 1);
         let host = pool.plan()[0];
-        pool.cancel_dial(host);
+        pool.release(host);
         assert_eq!(pool.plan(), vec![host], "an abandoned dial may be retried");
     }
 
@@ -536,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_can_be_pushed_past_its_target_when_a_slab_needs_a_new_host() {
+    fn the_pool_never_dials_past_its_target() {
         let list = keys(4);
         let mut pool = HostPool::new(FakeView::new(), list.clone(), 2);
         for host in pool.plan() {
@@ -547,25 +523,6 @@ mod tests {
             pool.plan().is_empty(),
             "the target is met, so nothing is dialled",
         );
-
-        let extra = pool.plan_extra(1);
-        assert_eq!(extra.len(), 1, "one beyond the target, on request");
-        assert!(
-            !pool.is_connected(&extra[0]),
-            "and it is a host not already in use",
-        );
-    }
-
-    #[test]
-    fn plan_extra_stops_when_the_candidates_run_out() {
-        let list = keys(2);
-        let mut pool = HostPool::new(FakeView::new(), list.clone(), 2);
-        for host in pool.plan() {
-            pool.settle(host, None);
-        }
-        assert!(
-            pool.plan_extra(5).is_empty(),
-            "every candidate is already connected",
-        );
+        assert_eq!(pool.dialling(), 0, "and nothing is left in flight");
     }
 }

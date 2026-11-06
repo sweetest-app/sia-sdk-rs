@@ -74,7 +74,7 @@ pub(crate) struct WorkerState {
     failure: Mutex<Option<UploadError>>,
     /// Pin attempts per slab, for the stale retry cap.
     pin_attempts: Mutex<HashMap<u64, usize>>,
-    workers: Mutex<Vec<AbortOnDropHandle<()>>>,
+    workers: Mutex<Vec<(PublicKey, AbortOnDropHandle<()>)>>,
     /// A shard became available.
     work: tokio::sync::Notify,
     /// A slab was pinned, or the upload stalled.
@@ -208,9 +208,16 @@ impl WorkerState {
     pub(crate) fn shutdown(&self) -> Vec<Slab> {
         self.closed.store(true, Ordering::SeqCst);
         self.work.notify_waiters();
-        // Dropping an AbortOnDropHandle aborts the task behind it.
-        let workers: Vec<AbortOnDropHandle<()>> = std::mem::take(&mut *self.workers.lock().unwrap());
-        drop(workers);
+        // Dropping an AbortOnDropHandle aborts the task behind it. A dial that is
+        // still running here never reports back, so its mark has to be released
+        // by hand or the pool believes it has a dial it does not have.
+        let workers: Vec<(PublicKey, AbortOnDropHandle<()>)> =
+            std::mem::take(&mut *self.workers.lock().unwrap());
+        let mut pool = self.pool.lock().unwrap();
+        for (host, handle) in workers {
+            pool.release(host);
+            drop(handle);
+        }
         let pinned = self.pinned.lock().unwrap();
         pinned.iter().flatten().cloned().collect()
     }
@@ -242,7 +249,7 @@ fn spawn_dials(state: &Arc<WorkerState>, planned: Vec<PublicKey>) {
         let handle = AbortOnDropHandle::new(maybe_spawn!(async move {
             dial_and_work(worker_state, host).await
         }));
-        state.workers.lock().unwrap().push(handle);
+        state.workers.lock().unwrap().push((host, handle));
     }
 }
 
@@ -404,9 +411,17 @@ async fn park(state: &Arc<WorkerState>) {
         let servable = state.queue.lock().unwrap().servable_by(&connected);
         if !servable {
             // Every connected host has served the slab that still wants shards,
-            // so one more host is the only way forward.
-            let extra = state.pool.lock().unwrap().plan_extra(1);
-            if extra.is_empty() {
+            // so the only way forward is another host. The pool dials up to its
+            // target; it never goes past it, because a slab needs thirty hosts
+            // and the target is sixty-four.
+            let planned = state.pool.lock().unwrap().plan();
+            if !planned.is_empty() {
+                debug!(
+                    "[pool] dialling {} more for the {pending} remaining shards",
+                    planned.len(),
+                );
+                spawn_dials(state, planned);
+            } else if state.pool.lock().unwrap().dialling() == 0 {
                 debug!(
                     "[pool] stalled: {pending} shards no connected host may write, and no candidate left",
                 );
@@ -414,9 +429,6 @@ async fn park(state: &Arc<WorkerState>) {
                     0,
                     state.registered().min(u8::MAX as usize) as u8,
                 ));
-            } else {
-                debug!("[pool] dialling one more host for the {pending} remaining shards");
-                spawn_dials(state, extra);
             }
         }
     }
