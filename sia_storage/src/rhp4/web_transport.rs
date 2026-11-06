@@ -37,6 +37,7 @@ use crate::client::metrics::TransferRate;
 use crate::time::{Duration, Instant, sleep, timeout};
 
 use super::dial_stats::DialStats;
+use super::dial_watch::{DialWatch, REFUSAL_WINDOW};
 use super::{Error, HostEndpoint};
 use crate::tokens::AccountTokenSource;
 
@@ -64,6 +65,12 @@ const RHP4_PATH: &str = "/sia/rhp/v4";
 /// Eight is double the old ceiling without adding enough load to starve the
 /// handshakes it is supposed to serve.
 const MAX_PENDING_CONNS: usize = 8;
+
+/// How often the watchdog re-reads the queue before deciding to give up. The
+/// browser holds a dial in its queue for a gap that grows with every failure it
+/// remembers, so a fixed deadline cannot tell a dial that is waiting from one
+/// that is silent.
+const WATCHDOG_TICK: Duration = Duration::from_secs(1);
 
 /// Timeout for opening a bidirectional stream on an established connection.
 /// The RPC's idle clock only starts once the stream is open, so a hung
@@ -426,6 +433,9 @@ pub struct Client {
     dial_sema: Rc<Semaphore>,
     failures: Rc<RefCell<DialStats>>,
     limits: Rc<Cell<Timeouts>>,
+    /// The dials in flight and the failures the browser counts, shared by every
+    /// clone so the deadline sees one queue.
+    watch: Rc<RefCell<DialWatch>>,
 }
 
 impl Default for Client {
@@ -453,17 +463,24 @@ impl Client {
     }
 
     pub fn new() -> Self {
+        let limits = Timeouts::default();
         Client {
             pool: Rc::new(RefCell::new(HashMap::new())),
             dial_sema: Rc::new(Semaphore::new(MAX_PENDING_CONNS)),
             failures: Rc::new(RefCell::new(DialStats::default())),
-            limits: Rc::new(Cell::new(Timeouts::default())),
+            limits: Rc::new(Cell::new(limits)),
+            watch: Rc::new(RefCell::new(DialWatch::new(limits.connect))),
         }
     }
 
     /// Overrides the connect and transfer caps for this client and its clones.
+    ///
+    /// The connect cap is the allowance a dial gets once it is at the front of
+    /// the browser's queue: how long a session may take from there. The wait in
+    /// the queue is not counted against it.
     pub(crate) fn set_timeouts(&self, timeouts: Timeouts) {
         self.limits.set(timeouts);
+        self.watch.borrow_mut().set_handshake(timeouts.connect);
     }
 
     fn timeouts(&self) -> Timeouts {
@@ -536,31 +553,82 @@ impl Client {
             .acquire()
             .await
             .map_err(|e| Error::Transport(format!("dial semaphore closed: {e}")))?;
+        let started = Instant::now();
+        let id = self.watch.borrow_mut().start(started);
+        let result = self.dial_each_address(id, started, addresses).await;
+        self.watch.borrow_mut().settle(id);
+        result
+    }
+
+    async fn dial_each_address(
+        &self,
+        id: u64,
+        started: Instant,
+        addresses: &[String],
+    ) -> Result<Rc<Connection>, Error> {
         let mut last_err = None;
         for addr in addresses {
             let dial_count = self.failures.borrow_mut().note_dial(addr);
             if dial_count > 1 {
                 debug!("[WT] re-dial #{dial_count} of {addr}");
             }
-            let started = Instant::now();
-            let result = timeout(self.timeouts().connect, connect(addr))
-                .await
-                .unwrap_or_else(|_| Err(Error::Transport("WebTransport connect: timeout".into())));
+            let attempt = Instant::now();
+            let result = self.connect_while_queued(id, started, addr).await;
             match result {
                 Ok(conn) => {
-                    debug!("[WT] handshake {addr} ok in {:?}", started.elapsed());
+                    debug!("[WT] handshake {addr} ok in {:?}", attempt.elapsed());
                     return Ok(Rc::new(conn));
                 }
                 Err(e) => {
                     debug!(
                         "[WT] handshake {addr} failed in {:?}: {e}",
-                        started.elapsed()
+                        attempt.elapsed()
                     );
+                    // A dial that dies this fast never reached the browser's
+                    // counter: the queue was full, or the address was refused
+                    // before a packet went out. Anything slower failed as a
+                    // handshake, and the browser is holding an entry for it.
+                    if attempt.elapsed() >= REFUSAL_WINDOW {
+                        self.watch.borrow_mut().note_failure(Instant::now());
+                    }
                     last_err = Some(e);
                 }
             }
         }
         Err(last_err.expect("at least one address was tried"))
+    }
+
+    /// Connects to one address, giving up only once nothing of ours is ahead of
+    /// the dial and it has then been silent for the handshake allowance.
+    async fn connect_while_queued(
+        &self,
+        id: u64,
+        started: Instant,
+        addr: &str,
+    ) -> Result<Connection, Error> {
+        let mut dial = Box::pin(connect(addr));
+        let mut deadline = started + self.timeouts().connect;
+        let mut front_since = started;
+        loop {
+            match timeout(WATCHDOG_TICK, &mut dial).await {
+                Ok(result) => return result,
+                Err(_) => {
+                    let now = Instant::now();
+                    // While another dial of ours is ahead, the allowance has not
+                    // started yet, so the deadline keeps moving out.
+                    if self.watch.borrow().ahead(id) != Some(0) {
+                        front_since = now;
+                    }
+                    deadline = self
+                        .watch
+                        .borrow_mut()
+                        .deadline(id, now, deadline, front_since);
+                    if now >= deadline {
+                        return Err(Error::Transport("WebTransport connect: timeout".into()));
+                    }
+                }
+            }
+        }
     }
 
     /// Evicts the host once its session's `closed` promise settles.

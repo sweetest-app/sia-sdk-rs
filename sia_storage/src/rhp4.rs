@@ -21,6 +21,8 @@ mod siamux;
 mod web_transport;
 
 mod dial_stats;
+#[cfg(any(target_arch = "wasm32", test))]
+mod dial_watch;
 
 #[cfg(any(test, feature = "mock"))]
 pub(crate) mod mock;
