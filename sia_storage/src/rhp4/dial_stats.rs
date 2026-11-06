@@ -22,6 +22,12 @@ impl DialStats {
         *count += 1;
         *count
     }
+
+    /// How many times `address` has been dialled, without counting this look.
+    #[cfg(test)]
+    pub(crate) fn dials(&self, address: &str) -> usize {
+        self.dials.get(address).copied().unwrap_or(0)
+    }
 }
 
 #[cfg(test)]

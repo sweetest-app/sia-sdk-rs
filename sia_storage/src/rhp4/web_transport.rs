@@ -780,14 +780,14 @@ mod tests {
             "a refusal never reached the browser's counter, so it adds nothing"
         );
         assert_eq!(
-            client.failures.borrow_mut().note_dial(address),
-            3,
-            "every attempt is still counted per address"
+            client.failures.borrow().dials(address),
+            2,
+            "both attempts were counted for the address"
         );
     }
 
     #[wasm_bindgen_test]
-    async fn test_address_listed_twice_is_dialed_once() {
+    async fn test_address_listed_twice_is_dialed_twice() {
         let address = "not a host either:9984";
         let quic = || sia_core::types::v2::NetAddress {
             protocol: Protocol::QUIC,
@@ -799,15 +799,17 @@ mod tests {
         };
         let client = Client::new();
 
-        // The second copy is skipped once the first is refused, so the error is the skip's.
-        let err = client
-            .connection(&host)
-            .await
-            .err()
-            .expect("the dial fails");
+        // There is no address bench any more: a dial that fails bans the host for
+        // the page, so the address list has nothing left to decide. Both copies are
+        // dialled, and the counter sees both.
         assert!(
-            err.to_string().contains("in the last five minutes"),
-            "the second copy was dialed: {err}"
+            client.connection(&host).await.is_err(),
+            "the dial fails either way"
+        );
+        assert_eq!(
+            client.failures.borrow().dials(address),
+            2,
+            "each copy of the address was dialled and counted"
         );
     }
 
