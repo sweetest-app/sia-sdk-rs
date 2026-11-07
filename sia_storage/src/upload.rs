@@ -1555,8 +1555,8 @@ mod tests {
         );
         assert_eq!(
             transport.connected_hosts(),
-            60,
-            "the pool fills to every candidate it can reach",
+            60.min(worker::WORKER_TARGET),
+            "the pool fills to the target, or to every candidate when there are fewer",
         );
     }
 
