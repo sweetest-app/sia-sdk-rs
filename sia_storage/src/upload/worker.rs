@@ -5,7 +5,6 @@
 //! host, so a host that is connected is never idle while shards are waiting,
 //! and a host keeps being used across slabs.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -60,6 +59,13 @@ pub(crate) struct WorkerState {
     /// Finished slabs, indexed by slab order. Filled by whichever worker pins
     /// the last shard of a slab.
     pinned: Mutex<Vec<Option<Slab>>>,
+    /// Shard bytes held by the upload right now: queued shards, the shards a
+    /// host is writing, and parity being encoded. The reader's buffer is added
+    /// by the upload itself.
+    held: AtomicUsize,
+    /// The highest `held` has ever been, so a caller does not have to sample it
+    /// often enough to catch the peak.
+    peak_held: AtomicUsize,
     /// Slabs handed to the schedule, and slabs pinned.
     registered: AtomicUsize,
     finished: AtomicUsize,
@@ -69,8 +75,6 @@ pub(crate) struct WorkerState {
     /// The error that stopped the upload, so `finish` can return it rather than
     /// a generic one.
     failure: Mutex<Option<UploadError>>,
-    /// Pin attempts per slab, for the stale retry cap.
-    pin_attempts: Mutex<HashMap<u64, usize>>,
     workers: Mutex<Vec<(PublicKey, AbortOnDropHandle<()>)>>,
     /// A shard became available.
     work: tokio::sync::Notify,
@@ -106,13 +110,14 @@ impl WorkerState {
             client,
             api_client,
             app_key,
+            held: AtomicUsize::new(0),
+            peak_held: AtomicUsize::new(0),
             pinned: Mutex::new(Vec::new()),
             registered: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             stalled: AtomicBool::new(false),
             failure: Mutex::new(None),
-            pin_attempts: Mutex::new(HashMap::new()),
             workers: Mutex::new(Vec::new()),
             work: tokio::sync::Notify::new(),
             done: tokio::sync::Notify::new(),
@@ -136,7 +141,37 @@ impl WorkerState {
         if self.is_closed() {
             return false;
         }
-        self.queue.lock().unwrap().add_shard(id, index, data)
+        let queued = self.queue.lock().unwrap().add_shard(id, index, data.clone());
+        if queued {
+            self.held_add(data.len());
+        }
+        queued
+    }
+
+    /// Adds to the shard bytes the upload is holding, and remembers the peak.
+    pub(crate) fn held_add(&self, bytes: usize) {
+        let now = self.held.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.peak_held.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// Releases shard bytes the upload no longer holds.
+    pub(crate) fn held_sub(&self, bytes: usize) {
+        self.held.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    /// Bytes held right now, as the upload counts them.
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    /// The highest `held_bytes` has been.
+    pub(crate) fn peak_held_bytes(&self) -> usize {
+        self.peak_held.load(Ordering::Relaxed)
+    }
+
+    /// Whether the slab has every data shard, so parity can be produced.
+    pub(crate) fn slab_ready_for_parity(&self, id: SlabId) -> bool {
+        self.queue.lock().unwrap().slab_ready_for_parity(id)
     }
 
     /// Reserves the pinned-slab slot for a newly registered slab.
@@ -208,6 +243,9 @@ impl WorkerState {
 
     pub(crate) fn shutdown(&self) -> Vec<Slab> {
         self.closed.store(true, Ordering::SeqCst);
+        // Every shard in flight is dropped with the workers, so nothing is held
+        // afterwards. The peak stays where it got to.
+        self.held.store(0, Ordering::Relaxed);
         self.work.notify_waiters();
         // Nothing is written for a slab nobody wants any more: the queue drops
         // its pending shards and every slab that is not pinned is abandoned.
@@ -342,6 +380,7 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
                     uploaded_at: Some(uploaded_at),
                 };
                 let finished = { state.queue.lock().unwrap().placed(&host, &request, placed) };
+                state.held_sub(request.data.len());
                 drop(permit);
                 if let Some(finished) = finished {
                     pin(&state, finished).await;
@@ -357,7 +396,9 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
                         short(&host)
                     );
                     state.pool.lock().unwrap().leave(host, LeaveReason::Closed);
+                    let dropped = request.data.len();
                     state.queue.lock().unwrap().failed(request);
+                    state.held_sub(dropped);
                     state.work.notify_waiters();
                     ensure_workers(&state);
                     return;
@@ -381,7 +422,9 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
                 // The pool logs the ban itself, with the counts it owns. One
                 // line per ban keeps the log readable and the count honest.
                 state.pool.lock().unwrap().leave(host, LeaveReason::Failed(reason));
+                let dropped = request.data.len();
                 state.queue.lock().unwrap().failed(request);
+                state.held_sub(dropped);
                 debug!(
                     "[pool] {} left: {}",
                     short(&host),
@@ -469,38 +512,18 @@ async fn pin(state: &Arc<WorkerState>, finished: FinishedSlab) {
             );
             state.done.notify_waiters();
         }
-        Err(UploadError::ApiError(error)) if error.is_slab_upload_too_old() => {
-            // The indexer refused it for age. The bytes are still here, so the
-            // same shards go out again rather than being encoded once more.
-            let attempts = {
-                let mut attempts = state.pin_attempts.lock().unwrap();
-                let count = attempts.entry(finished.id.0).or_insert(0);
-                *count += 1;
-                *count
-            };
-            if attempts >= super::MAX_SLAB_ATTEMPTS {
-                debug!(
-                    "[upload] slab {} was stale {attempts} times, giving up",
-                    finished.id.0,
-                );
-                state.stall(UploadError::StaleSlab(attempts));
-                return;
-            }
-            debug!(
-                "[upload] slab {} was stale, sending its shards again (attempt {attempts})",
-                finished.id.0,
-            );
-            state
-                .queue
-                .lock()
-                .unwrap()
-                .readd_slab(finished.id, finished.order, finished.shards, finished.seed);
-            state.work.notify_waiters();
-        }
         Err(error) => {
             // A pin that fails for good abandons the slab: its shards are spent
             // and nothing can be retried from here.
             let _ = finished.slab.pin_failed();
+            // An aged slab is named for what the indexer said. The pipeline
+            // keeps no shards to send again, so this is where the upload ends.
+            let error = match &error {
+                UploadError::ApiError(inner) if inner.is_slab_upload_too_old() => {
+                    UploadError::SlabTooOld(finished.id.0)
+                }
+                _ => error,
+            };
             debug!("[upload] slab {} could not be pinned: {error}", finished.id.0);
             state.stall(error);
         }

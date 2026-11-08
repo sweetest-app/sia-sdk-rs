@@ -96,7 +96,7 @@ impl ErasureCoder {
 }
 
 /// A streaming reader that interleaves incoming bytes across a slab's data
-/// shards as they become available. Yields a [ReadSlab] whenever a full slab
+/// shards as they become available. Yields a [SlabData] whenever a full slab
 /// has been accumulated; call [SlabReader::finish] to recover any trailing
 /// partial slab.
 pub(crate) struct SlabReader {
@@ -115,7 +115,7 @@ pub(crate) struct SlabReader {
 /// How much data is buffered before a single `apply_keystream` call.
 const READ_BUFFER_SIZE: usize = 64 << 10;
 
-pub(crate) struct ReadSlab {
+pub(crate) struct SlabData {
     pub encryption_key: EncryptionKey,
     pub length: usize,
     pub shards: Vec<Vec<u8>>,
@@ -139,6 +139,13 @@ async fn fill_buf<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> io::Result
 }
 
 impl SlabReader {
+    /// Bytes this reader allocates: its data shards and the landing buffer. They
+    /// exist for as long as the reader does, so they count as held memory even
+    /// when nothing is queued.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.shards.iter().map(Vec::capacity).sum::<usize>() + self.read_buffer.capacity()
+    }
+
     pub(crate) fn new(data_shards: usize) -> Self {
         Self {
             data_shards,
@@ -157,7 +164,7 @@ impl SlabReader {
     }
 
     /// Cumulative bytes that have landed in the pipeline across all
-    /// `read_slab` calls, including bytes from reads that errored part-way.
+    /// `read_shards` calls, including bytes from reads that errored part-way.
     /// Unlike [length](Self::length), this never resets when a slab is
     /// finalized.
     pub fn total_length(&self) -> u64 {
@@ -170,14 +177,14 @@ impl SlabReader {
     }
 
     /// Finalizes the slab reader, returning any remaining data as a slab.
-    pub fn finish(mut self) -> Option<ReadSlab> {
+    pub fn finish(mut self) -> Option<SlabData> {
         if self.length == 0 {
             return None;
         }
         let length = self.length;
         let shards = mem::take(&mut self.shards);
         let encryption_key = mem::replace(&mut self.encryption_key, [0u8; 32].into());
-        Some(ReadSlab {
+        Some(SlabData {
             encryption_key,
             length,
             shards,
@@ -190,11 +197,11 @@ impl SlabReader {
     ///
     /// If the optimal slab size is reached, the completed slab is returned.
     /// Any remaining data should be retrieved using [finish](Self::finish).
-    pub async fn read_slab<R: AsyncRead + Unpin>(
+    pub async fn read_shards<R: AsyncRead + Unpin>(
         &mut self,
         data_key: EncryptionKey,
         r: &mut R,
-    ) -> io::Result<(usize, Option<ReadSlab>)> {
+    ) -> io::Result<(usize, Option<SlabData>)> {
         if self.length == self.optimal_data_size() {
             return Ok((0, None));
         }
@@ -244,7 +251,7 @@ impl SlabReader {
             let shards = mem::replace(&mut self.shards, vec![vec![0u8; SECTOR_SIZE]; total_shards]);
             let encryption_key =
                 mem::replace(&mut self.encryption_key, rand::random::<[u8; 32]>().into());
-            Some(ReadSlab {
+            Some(SlabData {
                 encryption_key,
                 length,
                 shards,
@@ -266,9 +273,9 @@ mod tests {
         vec![i; SECTOR_SIZE]
     }
 
-    /// Reverses the per-segment encryption `read_slab` applies, restoring the
+    /// Reverses the per-segment encryption `read_shards` applies, restoring the
     /// data shards to plaintext so the striping assertions can compare against
-    /// the original input. Mirrors `read_slab`'s logical-order walk.
+    /// the original input. Mirrors `read_shards`'s logical-order walk.
     fn decrypt_data_shards(
         shards: &mut [Vec<u8>],
         data_shards: usize,
@@ -343,7 +350,7 @@ mod tests {
             let data_key = EncryptionKey::from([7u8; 32]);
             let mut reader = SlabReader::new(DATA_SHARDS);
             let (n, slab) = reader
-                .read_slab(data_key.clone(), &mut Cursor::new(data.clone()))
+                .read_shards(data_key.clone(), &mut Cursor::new(data.clone()))
                 .await
                 .unwrap();
             assert_eq!(n, expected_size, "data size {data_size} read mismatch");
@@ -399,7 +406,7 @@ mod tests {
         let data_key = EncryptionKey::from([7u8; 32]);
         let mut reader = SlabReader::new(DATA_SHARDS);
         let (n, slab) = reader
-            .read_slab(data_key.clone(), &mut Cursor::new(data.clone()))
+            .read_shards(data_key.clone(), &mut Cursor::new(data.clone()))
             .await
             .unwrap();
         assert_eq!(n, data.len());

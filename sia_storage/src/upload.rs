@@ -17,8 +17,6 @@ use crate::{
     AppKey, Download, DownloadOptions, Hosts, Object, PackedUploadOptions, Slab, UploadOptions,
 };
 use bytes::Bytes;
-#[cfg(test)]
-use chrono::Utc;
 use log::debug;
 use sia_core::signing::PublicKey;
 use thiserror::Error;
@@ -43,13 +41,11 @@ const QUEUE_HIGH_WATER: usize = 20;
 const INITIAL_INFLIGHT: usize = 8;
 const MIN_INFLIGHT: usize = 2;
 
-/// The ceiling the inflight controller may raise to, in shards. It is not a
-/// window: a slab is only held while a batch of its shards is being produced, so
-/// this bounds write concurrency rather than memory.
-/// The ceiling the inflight controller may raise to, in shards. Sixteen keeps the
-/// streams that share the uplink few enough that each keeps making progress: with
-/// ninety allowed, a 4 MiB write can go six seconds without a byte and the host
-/// closes the stream as idle.
+/// The ceiling the inflight controller may raise to, in shards. It bounds write
+/// concurrency, and therefore how many written-but-unacknowledged shards are
+/// held. Sixteen keeps the streams that share the uplink few enough that each
+/// keeps making progress: with ninety allowed, a 4 MiB write could go six
+/// seconds without a byte and the host closed the stream as idle.
 const MAX_INFLIGHT: usize = 16;
 
 /// Gates concurrent shard uploads at the [`InflightController`]'s current
@@ -198,9 +194,10 @@ pub enum UploadError {
     #[error("not enough shards: {0}/{1}")]
     NotEnoughShards(u8, u8),
 
-    /// The indexer rejected every upload of the slab as too old to pin.
-    #[error("slab stale after {0} upload attempts")]
-    StaleSlab(usize),
+    /// The indexer refused the slab as too old to pin. The shards are gone
+    /// from the hosts, and nothing is kept to send them again.
+    #[error("indexer rejected slab {0} as too old")]
+    SlabTooOld(u64),
 
     /// The requested range is out of bounds.
     #[error("invalid range: {0}-{1}")]
@@ -260,12 +257,6 @@ fn encode_batch(
     Ok(out)
 }
 
-impl slab::ShardSource for OpenSlab {
-    fn data_shards(&self) -> Vec<Bytes> {
-        self.plain.iter().flatten().cloned().collect()
-    }
-}
-
 impl slab::Placement for worker::WorkerState {
     fn enqueue(&self, slab: SlabId, index: usize, data: Bytes) -> bool {
         self.add_shard(slab, index, data)
@@ -315,10 +306,6 @@ async fn pin_uploaded_slab(
         }
     }
 }
-
-/// Maximum number of times a slab is uploaded before failing with
-/// [`UploadError::StaleSlab`].
-const MAX_SLAB_ATTEMPTS: usize = 3;
 
 /// A single-use streaming upload pipeline. Feed data into it by calling
 /// [read](Upload::read) repeatedly, then complete the upload with
@@ -378,10 +365,14 @@ impl Upload {
             options.shard_uploaded.clone(),
             options.shard_attempt.clone(),
         ));
+        let slab_buffer = SlabReader::new(options.data_shards as usize);
+        // The reader's shards and landing buffer exist for the life of the
+        // upload, so they count as held memory even when nothing is queued.
+        state.held_add(slab_buffer.allocated_bytes());
         Ok(Self {
             client,
             app_key,
-            slab_buffer: Some(SlabReader::new(options.data_shards as usize)),
+            slab_buffer: Some(slab_buffer),
             erasure_coder: Arc::new(erasure_coder),
             total_shards,
             open: HashMap::new(),
@@ -414,19 +405,23 @@ impl Upload {
     /// lets a host keep working across slabs instead of being spent on one.
     /// Opens a slab for shards that will arrive one at a time, after waiting for
     /// the queue to have room.
+    /// A handle that stops this upload from outside.
+    pub(crate) fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle {
+            state: self.state.clone(),
+        }
+    }
+
     pub(crate) async fn open_data_slab(
         &mut self,
         encryption_key: EncryptionKey,
         length: usize,
     ) -> Result<Option<SlabId>, UploadError> {
-        // Do not read another slab while the queue is full: the shards of a slab are
-        // the memory, so waiting for a host here is what bounds it.
-        while self.state.queued() > QUEUE_HIGH_WATER {
-            if self.state.is_closed() {
-                // Cancelled while waiting for room: nothing more is opened.
-                return Ok(None);
-            }
-            sleep(Duration::from_millis(50)).await;
+        // The public per-shard API can be driven without going through `read`,
+        // so it gates here too. In the read path the gate has already run and
+        // this is a no-op.
+        if !self.wait_for_room().await? {
+            return Ok(None);
         }
         let min_shards = self.erasure_coder.data_shards();
         debug!(
@@ -452,6 +447,18 @@ impl Upload {
         Ok(Some(id))
     }
 
+    /// Waits while the queue is over its high-water mark. Returns false when the
+    /// upload was cancelled while waiting, which means nothing more is opened.
+    async fn wait_for_room(&self) -> Result<bool, UploadError> {
+        while self.state.queued() > QUEUE_HIGH_WATER {
+            if self.state.is_closed() {
+                return Ok(false);
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        Ok(true)
+    }
+
     /// Queues one data shard, and starts the encoder once the last one is in.
     pub(crate) fn add_data_shard(
         &mut self,
@@ -475,15 +482,17 @@ impl Upload {
         open.plain[index] = Some(plain.clone());
         let key = open.key.clone();
 
-        // A data shard needs no encoding, so it can be written while the parity
-        // for the rest of the slab is still being produced.
+        // A data shard needs no other shard to be written, so it goes out as it
+        // arrives. The slab only has to know that every data shard is in before
+        // parity can be produced, which is checked below.
         let mut shard = plain.to_vec();
         encrypt_shard(&key, index as u8, 0, &mut shard);
         slab::Placement::enqueue(&*self.state, id, index, Bytes::from(shard));
         worker::ensure_workers(&self.state);
         self.state.notify_work();
 
-        let ready = open.plain.iter().all(Option::is_some);
+        let ready = open.plain.iter().all(Option::is_some)
+            && self.state.slab_ready_for_parity(id);
         if ready && !open.started {
             open.started = true;
             // The plaintext moves into the encoder task, which frees it once the
@@ -508,6 +517,11 @@ impl Upload {
             let encoded: Result<(), UploadError> = async move {
                 let _permit = slots.acquire().await;
                 let started = Instant::now();
+                // The plaintext is the encoder's input for every batch; the
+                // batches only split its output.
+                let inputs: Vec<Bytes> = open.plain.iter().flatten().cloned().collect();
+                let plain_bytes: usize = inputs.iter().map(Bytes::len).sum();
+                state.held_add(plain_bytes);
                 for first in (data_shards..total).step_by(PARITY_BATCH) {
                     // Cancelled while encoding: stop before the next batch rather
                     // than finish work whose shards nobody will write.
@@ -516,7 +530,9 @@ impl Upload {
                     }
                     let count = PARITY_BATCH.min(total - first);
                     let batch_coder = coder.clone();
-                    let inputs = slab::ShardSource::data_shards(&open);
+                    // Reference-counted pointers, so a batch costs nothing to hand
+                    // to the blocking task.
+                    let inputs = inputs.clone();
                     let mut out = maybe_spawn_blocking!({
                         encode_batch(&batch_coder, &inputs, first, count, size)
                     })?;
@@ -528,6 +544,7 @@ impl Upload {
                     }
                     state.notify_work();
                 }
+                state.held_sub(plain_bytes);
                 debug!("[upload] slab {} encoded in {:?}", id.0, started.elapsed());
                 Ok(())
             }
@@ -556,11 +573,18 @@ impl Upload {
         self.ensure_hosts().await?;
         let mut total_length: u64 = 0;
         loop {
+            // Room is checked before the disk is touched. Checking after the
+            // read meant a slab was always read and then held while the queue
+            // it could not join drained: one whole slab of memory past the
+            // high-water mark.
+            if !self.wait_for_room().await? {
+                return Ok(total_length);
+            }
             let (n, slab) = self
                 .slab_buffer
                 .as_mut()
                 .unwrap()
-                .read_slab(data_key.clone(), &mut reader)
+                .read_shards(data_key.clone(), &mut reader)
                 .await?;
             if n == 0 {
                 return Ok(total_length);
@@ -591,6 +615,9 @@ impl Upload {
             }
         }
         loop {
+            if self.state.is_closed() {
+                return Err(UploadError::Cancelled);
+            }
             let total = self.state.registered();
             if self.state.finished() >= total {
                 break;
@@ -665,6 +692,16 @@ impl Upload {
     pub(crate) fn pinned_slabs(&self) -> Vec<Option<Slab>> {
         self.state.pinned_slabs()
     }
+
+    /// Shard bytes the upload holds right now.
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.state.held_bytes()
+    }
+
+    /// The highest [`held_bytes`](Self::held_bytes) reached.
+    pub(crate) fn peak_held_bytes(&self) -> usize {
+        self.state.peak_held_bytes()
+    }
 }
 
 struct ObjectUpload {
@@ -679,6 +716,28 @@ struct ObjectUpload {
 impl Drop for Upload {
     fn drop(&mut self) {
         self.state.shutdown();
+    }
+}
+
+/// Stops an upload from outside the task that owns it.
+///
+/// There is no second signal: this sets the same closed flag the encoder and
+/// placement already consult, so every part of the upload stops for the same
+/// reason.
+#[derive(Clone)]
+pub struct CancelHandle {
+    state: Arc<worker::WorkerState>,
+}
+
+impl CancelHandle {
+    /// Stops the upload. Shards stop being queued, the encoder stops before its
+    /// next batch, and the dials are aborted.
+    pub fn cancel(&self) {
+        self.state.shutdown();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.is_closed()
     }
 }
 
@@ -700,6 +759,12 @@ pub struct PackedUpload {
 }
 
 impl PackedUpload {
+    /// A handle that stops this upload from outside, for callers that hold the
+    /// upload behind a lock.
+    pub fn cancel_handle(&self) -> CancelHandle {
+        self.upload.cancel_handle()
+    }
+
     pub(crate) fn new(
         client: Hosts,
         api_client: app_client::Client,
@@ -729,6 +794,18 @@ impl PackedUpload {
     /// Returns the optimal size of each slab.
     pub fn optimal_data_size(&self) -> usize {
         self.upload.optimal_data_size()
+    }
+
+    /// Shard bytes the upload holds right now: queued shards, the shards a host
+    /// is writing, parity being encoded, and the reader's buffer.
+    pub fn held_bytes(&self) -> usize {
+        self.upload.held_bytes()
+    }
+
+    /// The highest [`held_bytes`](Self::held_bytes) reached, so the peak does
+    /// not depend on how often a caller samples it.
+    pub fn peak_held_bytes(&self) -> usize {
+        self.upload.peak_held_bytes()
     }
 
     /// Returns the number of slabs after the upload is finalized.
@@ -1320,7 +1397,9 @@ mod tests {
             .unwrap()
             .expect("a slab opens while the upload is live");
 
-        upload.state.shutdown();
+        // The handle the browser layer uses: the same closed flag, no second
+        // signal beside it.
+        upload.cancel_handle().cancel();
         let before = upload.state.queued();
         for index in 0..10 {
             let _ = upload.add_data_shard(id, index, Bytes::from(vec![0u8; 4096]));
@@ -1331,6 +1410,142 @@ mod tests {
             before,
             "a cancelled upload queues nothing, and the encoder produces no parity"
         );
+    }
+
+    /// An encoder that has not produced its first batch stops instead of
+    /// finishing work whose shards nobody will write.
+    #[sia_core_derive::cross_target_test]
+    async fn test_cancel_before_the_first_parity_batch_stops_the_encoder() {
+        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
+        hosts.update(
+            (0..30)
+                .map(|_| test_host(PrivateKey::from_seed(&rand::random()).public_key()))
+                .collect(),
+            true,
+        );
+        let mut upload = Upload::new(
+            hosts,
+            app_client::Client::mock(),
+            Arc::new(AppKey::import(rand::random())),
+            UploadOptions::default(),
+        )
+        .unwrap();
+        upload.ensure_hosts().await.unwrap();
+
+        // Hold every encoder permit, so the slab's encoder is parked before its
+        // first batch and the cancel below lands mid-encode rather than after.
+        let first = upload.encoders.clone().acquire_owned().await.unwrap();
+        let second = upload.encoders.clone().acquire_owned().await.unwrap();
+
+        let id = upload
+            .open_data_slab(EncryptionKey::from([3u8; 32]), 4096)
+            .await
+            .unwrap()
+            .expect("a slab opens while the upload is live");
+        for index in 0..10 {
+            upload
+                .add_data_shard(id, index, Bytes::from(vec![0u8; 4096]))
+                .unwrap();
+        }
+
+        let handle = upload.cancel_handle();
+        handle.cancel();
+        // The parked encoder may proceed now, sees the closed flag before its
+        // first batch, and stops.
+        drop(first);
+        drop(second);
+        sleep(Duration::from_millis(50)).await;
+
+        assert!(handle.is_cancelled());
+        assert_eq!(
+            upload.state.queued(),
+            0,
+            "no parity was queued after the cancel"
+        );
+        assert_eq!(
+            upload.encoders.available_permits(),
+            ENCODERS_IN_FLIGHT,
+            "the encoder released its permit, so it stopped"
+        );
+    }
+
+    /// Held bytes count the reader's buffer and the shards in the queue, and
+    /// the peak keeps the highest value seen whether or not anyone samples.
+    #[sia_core_derive::cross_target_test]
+    async fn test_held_bytes_counts_the_reader_and_the_queue() {
+        use sia_core::rhp4::SECTOR_SIZE;
+        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
+        // No hosts are added, so a queued shard stays queued instead of being
+        // written, which is what makes the count observable.
+        let mut upload = Upload::new(
+            hosts,
+            app_client::Client::mock(),
+            Arc::new(AppKey::import(rand::random())),
+            UploadOptions::default(),
+        )
+        .unwrap();
+
+        let reader = upload.held_bytes();
+        assert!(
+            reader >= 10 * SECTOR_SIZE,
+            "the reader's ten data shards are held: {reader}"
+        );
+        assert_eq!(upload.peak_held_bytes(), reader);
+
+        let id = upload
+            .open_data_slab(EncryptionKey::from([3u8; 32]), SECTOR_SIZE)
+            .await
+            .unwrap()
+            .expect("a slab opens while the upload is live");
+        upload
+            .add_data_shard(id, 0, Bytes::from(vec![0u8; SECTOR_SIZE]))
+            .unwrap();
+
+        assert_eq!(
+            upload.held_bytes(),
+            reader + SECTOR_SIZE,
+            "one queued shard of four mebibytes"
+        );
+        assert_eq!(upload.peak_held_bytes(), reader + SECTOR_SIZE);
+
+        upload.state.shutdown();
+        assert_eq!(upload.held_bytes(), 0, "a stopped upload holds nothing");
+    }
+
+    /// A pinned slab is reported when the upload is cancelled, which is what a
+    /// caller resumes from.
+    #[sia_core_derive::cross_target_test]
+    async fn test_cancel_reports_the_pinned_slabs() {
+        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
+        hosts.update(
+            (0..30)
+                .map(|_| test_host(PrivateKey::from_seed(&rand::random()).public_key()))
+                .collect(),
+            true,
+        );
+        let mut upload = Upload::new(
+            hosts,
+            app_client::Client::mock(),
+            Arc::new(AppKey::import(rand::random())),
+            UploadOptions::default(),
+        )
+        .unwrap();
+        // One full slab, so the read flushes it and the workers pin it.
+        let size = upload.optimal_data_size();
+        upload
+            .read(
+                rand::random::<[u8; 32]>().into(),
+                Cursor::new(vec![1u8; size]),
+            )
+            .await
+            .unwrap();
+        while upload.state.finished() < upload.state.registered() {
+            let notified = upload.state.done_notify();
+            notified.await;
+        }
+
+        let pinned = upload.state.shutdown();
+        assert_eq!(pinned.len(), 1, "the pinned slab comes back for a resume");
     }
 
     #[sia_core_derive::cross_target_test]
@@ -1884,18 +2099,16 @@ mod tests {
         assert_eq!(api.pin_slabs_calls(), 3);
     }
 
-    /// Transient pin errors reuse the same request; the indexer rejecting the
-    /// slab as too old reuploads every shard with fresh upload times and
-    /// preserves the object's data.
+    /// A slab the indexer rejects as too old fails the upload: the shards are
+    /// written once and not kept, so there is nothing to send again.
     #[sia_core_derive::cross_target_test]
-    async fn test_upload_reuploads_when_indexer_rejects_slab() {
+    async fn test_upload_fails_when_the_indexer_rejects_slab() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let options = opts(3, 9);
         let total_shards = options.data_shards as usize + options.parity_shards as usize;
         let transport = mock::Client::new();
         let hosts = Hosts::new(Client::from_mock(transport));
-        // Two host sets let the reupload use previously unsampled hosts.
         hosts.update(
             (0..total_shards * 2)
                 .map(|_| test_host(PrivateKey::from_seed(&rand::random()).public_key()))
@@ -1906,13 +2119,13 @@ mod tests {
         let uploads = Arc::new(AtomicUsize::new(0));
         let counter = uploads.clone();
         let api = app_client::mock::Client::new();
+        // The first pin fails transiently, so it is retried with the same
+        // request. The second says the slab is too old, which ends the upload.
         api.set_pin_slabs_errors([
             app_client::Error::Api(StatusCode::INTERNAL_SERVER_ERROR, "temporary".into()),
             app_client::Error::Api(StatusCode::BAD_REQUEST, "slab upload is too old".into()),
-            app_client::Error::Api(StatusCode::INTERNAL_SERVER_ERROR, "temporary".into()),
         ]);
         let app_key = Arc::new(AppKey::import(rand::random()));
-        let before = Utc::now();
         let mut upload = Upload::new(
             hosts.clone(),
             app_client::Client::Mock(api.clone()),
@@ -1934,98 +2147,21 @@ mod tests {
             .read(object.data_key.clone(), Cursor::new(data.clone()))
             .await
             .unwrap();
-        let slabs = upload.finish().await.unwrap();
+        let error = upload.finish().await.unwrap_err();
 
-        assert_eq!(slabs.len(), 1);
-        assert_eq!(slabs[0].sectors.len(), total_shards);
-        let after = Utc::now();
-        // every shard uploaded twice; each upload's pin was retried once after
-        // a transient error, and only the second upload was pinned
-        assert_eq!(uploads.load(Ordering::SeqCst), total_shards * 2);
-        assert_eq!(api.pin_slabs_calls(), 4);
-        assert_eq!(api.pinned_slabs(), 1);
-
-        let requests = api.pin_slabs_requests();
-        assert_eq!(requests.len(), 4, "two pin requests per upload attempt");
-        assert_eq!(
-            requests[0], requests[1],
-            "first pin retry changed the request"
+        assert!(
+            matches!(error, UploadError::SlabTooOld(1)),
+            "expected the slab to be reported too old, got {error}"
         );
         assert_eq!(
-            requests[2], requests[3],
-            "second pin retry changed the request"
+            uploads.load(Ordering::SeqCst),
+            total_shards,
+            "the shards are written once and not kept for a reupload"
         );
-        for (shard_index, (first, second)) in requests[0][0]
-            .sectors
-            .iter()
-            .zip(&requests[2][0].sectors)
-            .enumerate()
-        {
-            assert_eq!(
-                first.sector.root, second.sector.root,
-                "shard {shard_index} changed its sector root on reupload"
-            );
-            // Upload times are UTC metadata, not a monotonic clock. Check
-            // that both attempts supply recent times without ordering them.
-            for (attempt, params) in [first, second].into_iter().enumerate() {
-                let uploaded_at = params.uploaded_at.expect("missing sector upload time");
-                assert!(
-                    before <= uploaded_at && uploaded_at <= after,
-                    "shard {shard_index} upload attempt {attempt}: {uploaded_at} outside {before}..={after}"
-                );
-            }
-        }
-
-        let object = Object { slabs, ..object };
-        let mut download =
-            Download::new(&object, hosts, app_key, DownloadOptions::default()).unwrap();
-        let mut downloaded = Vec::with_capacity(data.len());
-        tokio::io::copy(&mut download, &mut downloaded)
-            .await
-            .unwrap();
-        assert_eq!(downloaded, data, "reupload changed the object data");
-    }
-
-    /// An upload fails once [`MAX_SLAB_ATTEMPTS`] attempts have all gone
-    /// stale.
-    #[sia_core_derive::cross_target_test]
-    async fn test_upload_fails_after_max_stale_attempts() {
-        let options = opts(3, 9);
-        let total_shards = options.data_shards as usize + options.parity_shards as usize;
-        let transport = mock::Client::new();
-        let hosts = Hosts::new(Client::from_mock(transport));
-        hosts.update(
-            (0..total_shards * 2)
-                .map(|_| test_host(PrivateKey::from_seed(&rand::random()).public_key()))
-                .collect(),
-            true,
-        );
-
-        let api = app_client::mock::Client::new();
-        api.set_pin_slabs_errors((0..MAX_SLAB_ATTEMPTS).map(|_| {
-            app_client::Error::Api(StatusCode::BAD_REQUEST, "slab upload is too old".into())
-        }));
-        let mut upload = Upload::new(
-            hosts,
-            app_client::Client::Mock(api.clone()),
-            Arc::new(AppKey::import(rand::random())),
-            options,
-        )
-        .unwrap();
-
-        let mut data = BytesMut::zeroed(4096);
-        rand::rng().fill_bytes(&mut data);
-        upload
-            .read(
-                rand::random::<[u8; 32]>().into(),
-                Cursor::new(data.freeze()),
-            )
-            .await
-            .unwrap();
-        let err = upload.finish().await.unwrap_err();
-        assert!(matches!(err, UploadError::StaleSlab(attempts) if attempts == MAX_SLAB_ATTEMPTS));
-        // the indexer rejected every attempt, so none was pinned
-        assert_eq!(api.pin_slabs_calls(), MAX_SLAB_ATTEMPTS);
+        assert_eq!(api.pin_slabs_calls(), 2, "one retry, then the refusal");
         assert_eq!(api.pinned_slabs(), 0);
+        let requests = api.pin_slabs_requests();
+        assert_eq!(requests[0], requests[1], "a retry reuses the same request");
     }
+
 }

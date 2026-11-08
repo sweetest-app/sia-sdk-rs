@@ -2,9 +2,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 use tokio::sync::Mutex;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use tokio_util::sync::CancellationToken;
 
-use sia_storage::PackedUpload as CorePackedUpload;
+use sia_storage::{CancelHandle, PackedUpload as CorePackedUpload};
 use wasm_bindgen::prelude::*;
 
 use crate::helpers::to_js_err;
@@ -24,7 +23,7 @@ use crate::stream_reader::js_stream_reader;
 #[wasm_bindgen]
 pub struct PackedUpload {
     inner: Rc<Mutex<Option<CorePackedUpload>>>,
-    cancel: CancellationToken,
+    cancel: CancelHandle,
     optimal_data_size: f64,
     length: Cell<f64>,
 }
@@ -32,9 +31,10 @@ pub struct PackedUpload {
 impl PackedUpload {
     pub(crate) fn new(inner: CorePackedUpload) -> Self {
         let optimal_data_size = inner.optimal_data_size() as f64;
+        let cancel = inner.cancel_handle();
         Self {
             inner: Rc::new(Mutex::new(Some(inner))),
-            cancel: CancellationToken::new(),
+            cancel,
             optimal_data_size,
             length: Cell::new(0.0),
         }
@@ -46,13 +46,30 @@ impl PackedUpload {
     /// Bytes remaining until the current slab is full. Adding objects that
     /// fit within this size avoids starting a new slab and minimizes padding.
     pub fn remaining(&self) -> f64 {
-        let length = self.length.get();
-        self.optimal_data_size - (length % self.optimal_data_size)
+        remaining(self.length.get(), self.optimal_data_size)
     }
 
     /// Total bytes added so far across all objects.
     pub fn length(&self) -> f64 {
         self.length.get()
+    }
+
+    /// Shard bytes the upload holds right now: queued shards, the shards a host
+    /// is writing, parity being encoded, and the reader's buffer.
+    #[wasm_bindgen(js_name = "heldBytes")]
+    pub async fn held_bytes(&self) -> Result<f64, JsError> {
+        let guard = self.inner.lock().await;
+        let pu = guard.as_ref().ok_or_else(|| JsError::new("upload closed"))?;
+        Ok(pu.held_bytes() as f64)
+    }
+
+    /// The highest [`heldBytes`](Self::held_bytes) reached, so the peak does
+    /// not depend on how often it is sampled.
+    #[wasm_bindgen(js_name = "peakHeldBytes")]
+    pub async fn peak_held_bytes(&self) -> Result<f64, JsError> {
+        let guard = self.inner.lock().await;
+        let pu = guard.as_ref().ok_or_else(|| JsError::new("upload closed"))?;
+        Ok(pu.peak_held_bytes() as f64)
     }
 
     /// Number of slabs in the upload.
@@ -93,26 +110,17 @@ impl PackedUpload {
             return Err(JsError::new("upload closed"));
         }
         let reader = js_stream_reader(stream).compat();
-        let inner = self.inner.clone();
-        let cancel = self.cancel.clone();
-        let result: Result<u64, JsError> = tokio::select! {
-            _ = cancel.cancelled() => Err(JsError::new("upload closed")),
-            r = async {
-                let mut guard = inner.lock().await;
-                // Take ownership so cancel's drop-cascade can abort in-flight
-                // slab uploads (they're held as AbortOnDropHandles inside pu).
-                let mut pu = guard.take().ok_or_else(|| JsError::new("upload closed"))?;
-                let res = pu.add(reader).await.map_err(to_js_err);
-                // Mirror pu.length() rather than accumulating the add's
-                // returned size, so partial bytes from an errored add (now
-                // kept in pu.length()) stay accounted for.
-                let total = pu.length() as f64;
-                *guard = Some(pu);
-                self.length.set(total);
-                res
-            } => r,
-        };
-        Ok(result? as f64)
+        let mut guard = self.inner.lock().await;
+        // Taking the upload out lets a cancel drop it and abort its slab
+        // uploads; the core's closed flag is what stops the work itself.
+        let mut pu = guard.take().ok_or_else(|| JsError::new("upload closed"))?;
+        let res = pu.add(reader).await.map_err(to_js_err);
+        // Mirror pu.length() rather than accumulating the add's returned size,
+        // so partial bytes from an errored add stay accounted for.
+        let total = pu.length() as f64;
+        *guard = Some(pu);
+        self.length.set(total);
+        Ok(res? as f64)
     }
 
     /// Opens a slab for shards that arrive one at a time, and returns its id.
@@ -151,17 +159,10 @@ impl PackedUpload {
         if self.cancel.is_cancelled() {
             return Err(JsError::new("upload closed"));
         }
-        let inner = self.inner.clone();
-        let cancel = self.cancel.clone();
-        let result: Result<Vec<sia_storage::Object>, JsError> = tokio::select! {
-            _ = cancel.cancelled() => Err(JsError::new("upload closed")),
-            r = async {
-                let mut guard = inner.lock().await;
-                let pu = guard.take().ok_or_else(|| JsError::new("upload closed"))?;
-                pu.finalize().await.map_err(to_js_err)
-            } => r,
-        };
-        Ok(result?.into_iter().map(PinnedObject).collect())
+        let mut guard = self.inner.lock().await;
+        let pu = guard.take().ok_or_else(|| JsError::new("upload closed"))?;
+        let objects = pu.finalize().await.map_err(to_js_err)?;
+        Ok(objects.into_iter().map(PinnedObject).collect())
     }
 
     /// The objects whose slabs have all pinned, indexed the same way
@@ -194,41 +195,32 @@ impl PackedUpload {
     /// Cancels the packed upload. Immediately interrupts any in-flight `add`
     /// and aborts all pending slab uploads.
     pub fn cancel(&self) {
+        // The one signal: the core's closed flag. Every task of the upload
+        // observes it, and the shards in the queue are dropped with it.
         self.cancel.cancel();
-        // If no add/finalize is holding the lock, drop pu here to abort any
-        // background slab uploads. If one is holding it, its select! will
-        // drop pu when it observes the cancel token.
         if let Ok(mut guard) = self.inner.try_lock() {
             guard.take();
         }
     }
 }
 
+/// Bytes remaining in the current slab, given what has been added so far.
+fn remaining(length: f64, optimal_data_size: f64) -> f64 {
+    optimal_data_size - (length % optimal_data_size)
+}
+
 #[cfg(test)]
 mod packed_remaining_tests {
-    use super::*;
-
-    fn upload(length: f64, optimal_data_size: f64) -> PackedUpload {
-        PackedUpload {
-            inner: Rc::new(Mutex::new(None)),
-            cancel: CancellationToken::new(),
-            optimal_data_size,
-            length: Cell::new(length),
-        }
-    }
+    use super::remaining;
 
     #[test]
     fn a_full_slab_reports_a_whole_slab_free() {
         let optimal = (40 << 20) as f64;
-        assert_eq!(
-            upload(0.0, optimal).remaining(),
-            optimal,
-            "nothing added yet"
-        );
-        assert_eq!(upload(optimal / 2.0, optimal).remaining(), optimal / 2.0);
+        assert_eq!(remaining(0.0, optimal), optimal, "nothing added yet");
+        assert_eq!(remaining(optimal / 2.0, optimal), optimal / 2.0);
         // The slab rolled over, so the next one is empty. Reporting 0 here
         // would tell a caller every further add starts a new slab.
-        assert_eq!(upload(optimal, optimal).remaining(), optimal);
-        assert_eq!(upload(2.0 * optimal, optimal).remaining(), optimal);
+        assert_eq!(remaining(optimal, optimal), optimal);
+        assert_eq!(remaining(2.0 * optimal, optimal), optimal);
     }
 }

@@ -467,7 +467,6 @@ export interface ObjectSummary {
 
 /** Packed upload options. */
 export interface PackedUploadOptions {
-  maxBufferedSlabs?: number
   dataShards?: number
   parityShards?: number
   onShardUploaded?: (progress: ShardProgress) => void
@@ -555,7 +554,6 @@ export interface Slab {
 
 /** Upload options. */
 export interface UploadOptions {
-  maxBufferedSlabs?: number
   dataShards?: number
   parityShards?: number
   startOffset?: bigint

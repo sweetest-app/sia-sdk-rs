@@ -1,24 +1,28 @@
 //! One slab's life, from the first data shard to the pin.
 //!
-//! The state is here and nowhere else. Shards arrive from the caller as the file
-//! is sliced, parity is produced from them, workers place them one at a time, and
-//! the slab is pinned when the last one lands. Every one of those is an event on
-//! this type, and an event that does not fit the current state is refused rather
-//! than ignored.
+//! A shard is a slab, an index, and 4 MiB of bytes. Data shards come from the
+//! file read and parity shards from the encoder, but once a shard exists the
+//! slab does not care where it came from: it is placed the same way, and every
+//! event below treats it the same.
+//!
+//! Two facts are tracked separately, because they move independently:
+//!
+//! * whether every data shard is in, which is the encoder's only trigger, and
+//! * how many of the slab's shards have been placed, which is what a pin needs.
+//!
+//! Placement does not wait for the data to be complete. A shard that exists can
+//! be given to a host immediately.
 
 use bytes::Bytes;
 
 use crate::schedule::SlabId;
 
-/// Where a slab is in its life.
+/// Where a slab is. Only the pin gates anything, so there are three states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SlabState {
-    /// Data shards are arriving. Nothing has been encoded or placed.
+    /// Taking shards, data and parity alike. This is the whole life of the slab
+    /// up to its pin.
     Open,
-    /// Every data shard is in. Parity may be produced from here.
-    Frozen,
-    /// Shards are queued and being placed.
-    Placing,
     /// Every shard landed and the indexer accepted the pin.
     Pinned,
     /// Cancelled, or the pin failed for good. Its shards are wasted.
@@ -28,10 +32,8 @@ pub(crate) enum SlabState {
 /// An event that does not fit the slab's current state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SlabError {
-    WrongState {
-        expected: SlabState,
-        actual: SlabState,
-    },
+    /// The slab is pinned or abandoned and takes no more events.
+    Closed { state: SlabState },
     DataShardOutOfRange,
     DataShardAlreadyAdded,
     ShardOutOfRange,
@@ -39,14 +41,22 @@ pub(crate) enum SlabError {
     ShardNotPlaced,
 }
 
+impl SlabError {
+    fn closed(state: SlabState) -> Self {
+        Self::Closed { state }
+    }
+}
+
 /// One slab's lifecycle.
 #[derive(Debug)]
 pub(crate) struct Slab {
     id: SlabId,
     state: SlabState,
-    /// The data shards, filled as they arrive. These are the source the encoder
-    /// reads from.
-    data: Vec<Option<Bytes>>,
+    /// One slot per data shard, marked as the shard is produced. A slot rather
+    /// than a counter, so a data shard reported twice cannot make the slab look
+    /// ready for parity.
+    data: Vec<bool>,
+    data_count: usize,
     /// One entry per shard of the slab, data and parity.
     placed: Vec<bool>,
     placed_count: usize,
@@ -59,7 +69,8 @@ impl Slab {
         Self {
             id,
             state: SlabState::Open,
-            data: vec![None; data_shards],
+            data: vec![false; data_shards],
+            data_count: 0,
             placed: vec![false; total],
             placed_count: 0,
         }
@@ -81,72 +92,35 @@ impl Slab {
         self.placed_count
     }
 
-    /// Takes one data shard. Only while the slab is open, and only once per
-    /// index.
-    pub(crate) fn add_data_shard(&mut self, index: usize, data: Bytes) -> Result<(), SlabError> {
+    /// Takes one data shard. Allowed at any point before the pin, and only once
+    /// per index.
+    pub(crate) fn add_data_shard(&mut self, index: usize, _data: Bytes) -> Result<(), SlabError> {
         if self.state != SlabState::Open {
-            return Err(SlabError::WrongState {
-                expected: SlabState::Open,
-                actual: self.state,
-            });
+            return Err(SlabError::closed(self.state));
         }
         let slot = self
             .data
             .get_mut(index)
             .ok_or(SlabError::DataShardOutOfRange)?;
-        if slot.is_some() {
+        if *slot {
             return Err(SlabError::DataShardAlreadyAdded);
         }
-        *slot = Some(data);
+        *slot = true;
+        self.data_count += 1;
         Ok(())
     }
 
-    /// Every data shard has arrived, so the slab's bytes are fixed.
-    pub(crate) fn all_data(&self) -> bool {
-        self.data.iter().all(Option::is_some)
+    /// Every data shard is in, so parity may be produced. This is the encoder's
+    /// trigger and nothing else: placement does not wait for it.
+    pub(crate) fn all_data_shards_ready(&self) -> bool {
+        self.data_count == self.data.len()
     }
 
-    /// Freezes the slab: its data is complete and parity may be produced.
-    pub(crate) fn freeze(&mut self) -> Result<(), SlabError> {
-        if self.state != SlabState::Open {
-            return Err(SlabError::WrongState {
-                expected: SlabState::Open,
-                actual: self.state,
-            });
-        }
-        if !self.all_data() {
-            return Err(SlabError::WrongState {
-                expected: SlabState::Frozen,
-                actual: self.state,
-            });
-        }
-        self.state = SlabState::Frozen;
-        Ok(())
-    }
-
-    /// Placing begins once at least one shard has been queued.
-    pub(crate) fn begin_placing(&mut self) -> Result<(), SlabError> {
-        match self.state {
-            SlabState::Frozen => {
-                self.state = SlabState::Placing;
-                Ok(())
-            }
-            SlabState::Placing => Ok(()),
-            actual => Err(SlabError::WrongState {
-                expected: SlabState::Frozen,
-                actual,
-            }),
-        }
-    }
-
-    /// Records a shard that landed. Refused outside placing, out of range, or
-    /// for a shard that already landed.
+    /// Records a shard that landed. Data and parity are recorded the same way;
+    /// the index decides which shard it is, not the producer.
     pub(crate) fn shard_placed(&mut self, index: usize) -> Result<(), SlabError> {
-        if self.state != SlabState::Placing {
-            return Err(SlabError::WrongState {
-                expected: SlabState::Placing,
-                actual: self.state,
-            });
+        if self.state != SlabState::Open {
+            return Err(SlabError::closed(self.state));
         }
         let slot = self
             .placed
@@ -167,11 +141,8 @@ impl Slab {
     /// The indexer accepted the pin. Only a slab with every shard placed can be
     /// pinned.
     pub(crate) fn pin_ok(&mut self) -> Result<(), SlabError> {
-        if self.state != SlabState::Placing {
-            return Err(SlabError::WrongState {
-                expected: SlabState::Placing,
-                actual: self.state,
-            });
+        if self.state != SlabState::Open {
+            return Err(SlabError::closed(self.state));
         }
         if !self.all_placed() {
             return Err(SlabError::ShardNotPlaced);
@@ -182,11 +153,8 @@ impl Slab {
 
     /// The indexer refused the pin for good.
     pub(crate) fn pin_failed(&mut self) -> Result<(), SlabError> {
-        if self.state != SlabState::Placing {
-            return Err(SlabError::WrongState {
-                expected: SlabState::Placing,
-                actual: self.state,
-            });
+        if self.state != SlabState::Open {
+            return Err(SlabError::closed(self.state));
         }
         self.state = SlabState::Abandoned;
         Ok(())
@@ -196,24 +164,14 @@ impl Slab {
     /// for, so they stay pinned.
     pub(crate) fn cancel(&mut self) -> Result<(), SlabError> {
         match self.state {
-            SlabState::Pinned => Err(SlabError::WrongState {
-                expected: SlabState::Abandoned,
-                actual: SlabState::Pinned,
-            }),
+            SlabState::Pinned => Err(SlabError::closed(SlabState::Pinned)),
             SlabState::Abandoned => Ok(()),
-            _ => {
+            SlabState::Open => {
                 self.state = SlabState::Abandoned;
                 Ok(())
             }
         }
     }
-}
-
-/// The slab's data shards, which is what the encoder reads. The source helper:
-/// the coordinator never reaches into a slab for its bytes itself.
-/// Clones are pointer copies: `Bytes` is reference counted.
-pub(crate) trait ShardSource {
-    fn data_shards(&self) -> Vec<Bytes>;
 }
 
 /// Produces a range of a slab's shards from its data shards.
@@ -255,9 +213,8 @@ mod tests {
     }
 
     #[test]
-    fn data_shards_are_taken_only_while_open_and_only_once() {
+    fn data_shards_are_taken_only_once() {
         let mut slab = open();
-        assert_eq!(slab.state(), SlabState::Open);
         slab.add_data_shard(0, byte(1)).unwrap();
         assert_eq!(
             slab.add_data_shard(0, byte(1)),
@@ -270,51 +227,35 @@ mod tests {
     }
 
     #[test]
-    fn a_slab_freezes_only_with_every_data_shard() {
+    fn all_data_shards_ready_needs_every_one() {
         let mut slab = open();
-        slab.add_data_shard(0, byte(0)).unwrap();
-        assert!(slab.freeze().is_err(), "one of ten is not the data");
-        for index in 1..10 {
+        for index in 0..9 {
             slab.add_data_shard(index, byte(index as u8)).unwrap();
+            assert!(!slab.all_data_shards_ready(), "{index} of ten is not all");
         }
-        slab.freeze().unwrap();
-        assert_eq!(slab.state(), SlabState::Frozen);
-        assert_eq!(
-            slab.add_data_shard(0, byte(9)),
-            Err(SlabError::WrongState {
-                expected: SlabState::Open,
-                actual: SlabState::Frozen,
-            })
-        );
+        slab.add_data_shard(9, byte(9)).unwrap();
+        assert!(slab.all_data_shards_ready());
     }
 
     #[test]
-    fn a_shard_cannot_be_placed_before_the_slab_is_placed() {
+    fn a_shard_is_placed_before_the_data_is_complete() {
+        let mut slab = open();
+        slab.add_data_shard(0, byte(0)).unwrap();
+        assert!(!slab.all_data_shards_ready(), "nine data shards are missing");
+        slab.shard_placed(0).expect("a shard that exists can be placed");
+        assert_eq!(slab.placed_count(), 1);
+    }
+
+    #[test]
+    fn a_parity_shard_is_placed_the_same_way() {
         let mut slab = with_data();
-        assert_eq!(
-            slab.shard_placed(0),
-            Err(SlabError::WrongState {
-                expected: SlabState::Placing,
-                actual: SlabState::Open,
-            })
-        );
-        slab.freeze().unwrap();
-        assert_eq!(
-            slab.shard_placed(0),
-            Err(SlabError::WrongState {
-                expected: SlabState::Placing,
-                actual: SlabState::Frozen,
-            })
-        );
-        slab.begin_placing().unwrap();
-        slab.shard_placed(0).unwrap();
+        slab.shard_placed(25).expect("a parity shard is a shard");
+        assert_eq!(slab.placed_count(), 1);
     }
 
     #[test]
     fn a_shard_placed_twice_is_refused() {
         let mut slab = with_data();
-        slab.freeze().unwrap();
-        slab.begin_placing().unwrap();
         slab.shard_placed(3).unwrap();
         assert_eq!(slab.shard_placed(3), Err(SlabError::ShardAlreadyPlaced));
         assert_eq!(slab.placed_count(), 1);
@@ -323,8 +264,6 @@ mod tests {
     #[test]
     fn a_slab_pins_only_with_every_shard() {
         let mut slab = with_data();
-        slab.freeze().unwrap();
-        slab.begin_placing().unwrap();
         for index in 0..29 {
             slab.shard_placed(index).unwrap();
         }
@@ -337,39 +276,27 @@ mod tests {
     #[test]
     fn a_pin_failure_abandons_the_slab() {
         let mut slab = with_data();
-        slab.freeze().unwrap();
-        slab.begin_placing().unwrap();
         slab.pin_failed().unwrap();
         assert_eq!(slab.state(), SlabState::Abandoned);
         assert_eq!(
             slab.shard_placed(0),
-            Err(SlabError::WrongState {
-                expected: SlabState::Placing,
-                actual: SlabState::Abandoned,
-            })
+            Err(SlabError::closed(SlabState::Abandoned))
         );
     }
 
     #[test]
     fn cancel_abandons_anything_not_pinned() {
-        for stop in [SlabState::Open, SlabState::Frozen, SlabState::Placing] {
-            let mut slab = with_data();
-            match stop {
-                SlabState::Open => {}
-                SlabState::Frozen => slab.freeze().unwrap(),
-                SlabState::Placing => {
-                    slab.freeze().unwrap();
-                    slab.begin_placing().unwrap();
-                }
-                _ => unreachable!(),
-            }
-            slab.cancel().unwrap();
-            assert_eq!(slab.state(), SlabState::Abandoned, "from {stop:?}");
-        }
+        let mut fresh = open();
+        fresh.cancel().unwrap();
+        assert_eq!(fresh.state(), SlabState::Abandoned, "from no data");
+
+        let mut mid = open();
+        mid.add_data_shard(0, byte(0)).unwrap();
+        mid.shard_placed(0).unwrap();
+        mid.cancel().unwrap();
+        assert_eq!(mid.state(), SlabState::Abandoned, "from a placed shard");
 
         let mut pinned = with_data();
-        pinned.freeze().unwrap();
-        pinned.begin_placing().unwrap();
         for index in 0..30 {
             pinned.shard_placed(index).unwrap();
         }
@@ -382,83 +309,31 @@ mod tests {
     }
 
     #[test]
-    fn every_event_out_of_state_is_refused() {
-        // The four states a slab can be cancelled from, crossed with the events
-        // that must not be accepted there. A refused event leaves the state
-        // alone, which is what makes the machine safe to drive from callbacks.
-        let states = [
-            SlabState::Open,
-            SlabState::Frozen,
-            SlabState::Placing,
-            SlabState::Pinned,
-            SlabState::Abandoned,
-        ];
-        for state in states {
-            let mut slab = if state == SlabState::Open {
-                open()
-            } else {
-                with_data()
-            };
-            if matches!(state, SlabState::Frozen | SlabState::Placing | SlabState::Pinned) {
-                slab.freeze().unwrap();
-            }
-            if matches!(state, SlabState::Placing | SlabState::Pinned) {
-                slab.begin_placing().unwrap();
+    fn a_closed_slab_takes_no_events() {
+        for state in [SlabState::Pinned, SlabState::Abandoned] {
+            let mut slab = with_data();
+            for index in 0..30 {
+                slab.shard_placed(index).unwrap();
             }
             if state == SlabState::Pinned {
-                for index in 0..30 {
-                    slab.shard_placed(index).unwrap();
-                }
                 slab.pin_ok().unwrap();
+            } else {
+                slab.pin_failed().unwrap();
             }
-            if state == SlabState::Abandoned {
-                slab.cancel().unwrap();
-            }
-            assert_eq!(slab.state(), state, "setup for {state:?}");
+            assert_eq!(slab.state(), state);
 
-            let expects_open = slab.add_data_shard(0, byte(0));
-            let expects_freeze = slab.freeze();
-            let expects_place = slab.shard_placed(0);
-            let expects_pin = slab.pin_ok();
-            let expects_fail = slab.pin_failed();
-
-            match state {
-                SlabState::Open => {
-                    assert!(expects_open.is_ok(), "open takes data");
-                    assert!(expects_freeze.is_err(), "data was added twice");
-                    assert!(expects_place.is_err());
-                    assert!(expects_pin.is_err());
-                    assert!(expects_fail.is_err());
-                }
-                SlabState::Frozen => {
-                    assert!(expects_open.is_err(), "frozen takes no data");
-                    assert!(expects_freeze.is_err(), "already frozen");
-                    assert!(expects_place.is_err(), "not placing yet");
-                    assert!(expects_pin.is_err());
-                    assert!(expects_fail.is_err());
-                }
-                SlabState::Placing => {
-                    assert!(expects_open.is_err());
-                    assert!(expects_freeze.is_err());
-                    assert!(expects_place.is_ok(), "placing takes shards");
-                    assert!(expects_pin.is_err(), "not every shard landed");
-                    assert!(expects_fail.is_ok(), "a pin can fail while placing");
-                }
-                SlabState::Pinned => {
-                    assert!(expects_open.is_err());
-                    assert!(expects_freeze.is_err());
-                    assert!(expects_place.is_err());
-                    assert!(expects_pin.is_err());
-                    assert!(expects_fail.is_err());
-                }
-                SlabState::Abandoned => {
-                    assert!(expects_open.is_err());
-                    assert!(expects_freeze.is_err());
-                    assert!(expects_place.is_err());
-                    assert!(expects_pin.is_err());
-                    assert!(expects_fail.is_err());
-                }
-            }
+            assert_eq!(
+                slab.add_data_shard(0, byte(0)),
+                Err(SlabError::closed(state)),
+                "data shard into {state:?}"
+            );
+            assert_eq!(
+                slab.shard_placed(0),
+                Err(SlabError::closed(state)),
+                "placed shard into {state:?}"
+            );
+            assert_eq!(slab.pin_ok(), Err(SlabError::closed(state)));
+            assert_eq!(slab.pin_failed(), Err(SlabError::closed(state)));
         }
     }
 }

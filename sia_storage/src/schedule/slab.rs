@@ -24,15 +24,13 @@ pub(crate) struct SlabSeed {
 
 /// A slab whose every shard has landed, ready to pin.
 ///
-/// It carries its shards because the indexer can reject a slab as stale, and the
-/// retry re-uploads the same bytes rather than encoding them again. The shards
-/// are reference counted, so this is pointers, not another copy of the data.
+/// It carries the sectors and the header, not the shard bytes. Those left with
+/// the hosts, which is what keeps memory proportional to the shards in flight
+/// instead of to the slabs that happen to be open.
 #[derive(Debug)]
 pub(crate) struct FinishedSlab {
     pub id: SlabId,
-    pub order: u64,
     pub seed: SlabSeed,
-    pub shards: Vec<Bytes>,
     pub pin: SlabPinParams,
     /// The lifecycle that produced it, so the pin result is recorded on the same
     /// slab rather than on a copy of its counters.
@@ -46,54 +44,30 @@ pub(crate) struct FinishedSlab {
 /// shards of a half finished slab are work that cannot be kept.
 #[derive(Debug)]
 pub(crate) struct SlabTracker {
-    /// The lifecycle: open, frozen, placing, pinned or abandoned, and which
-    /// shards have landed.
+    /// The lifecycle: which data shards are in, which shards have landed, and
+    /// whether it is pinned or abandoned.
     slab: Slab,
     seed: SlabSeed,
-    /// The shards that have been produced, kept until the slab is pinned so a
-    /// stale retry can send the same bytes again. `None` until produced: data
-    /// shards arrive from the caller, parity from the encoder.
-    shards: Vec<Option<Bytes>>,
     /// One entry per shard, filled as the shards land. A slot, not a counter,
     /// so a shard reported twice cannot make a slab look complete.
     sectors: Vec<Option<SectorPinParams>>,
     /// Hosts that have placed a shard here. One shard per host per slab, so a
     /// single host losing its disk cannot take two shards of the same slab.
     served: HashSet<PublicKey>,
-    /// Creation order, for the tie-break between equally unfinished slabs.
-    order: u64,
 }
 
 impl SlabTracker {
-    /// A slab whose shards are all known already, used when a slab is put back
-    /// for another attempt.
-    pub(crate) fn new(id: SlabId, order: u64, seed: SlabSeed, shards: Vec<Bytes>) -> Self {
-        let total = shards.len();
-        let mut tracker = Self::open(id, order, seed, total);
-        for (index, shard) in shards.into_iter().enumerate() {
-            tracker.push(index, shard);
-        }
-        tracker
-    }
-
-    /// Opens a slab whose shards are produced one at a time.
-    pub(crate) fn open(id: SlabId, order: u64, seed: SlabSeed, total: usize) -> Self {
+    /// Opens a slab and sets its seed. Its shards are produced one at a time.
+    pub(crate) fn open(id: SlabId, seed: SlabSeed, total: usize) -> Self {
         let data_shards = seed.min_shards as usize;
         Self {
             slab: Slab::open(id, data_shards, total),
             seed,
-            shards: vec![None; total],
             sectors: vec![None; total],
             served: HashSet::new(),
-            order,
         }
     }
 
-    pub(crate) fn order(&self) -> u64 {
-        self.order
-    }
-
-    #[cfg(test)]
     pub(crate) fn state(&self) -> SlabState {
         self.slab.state()
     }
@@ -111,6 +85,11 @@ impl SlabTracker {
         self.slab.all_placed()
     }
 
+    /// Every data shard is in, so parity may be produced.
+    pub(crate) fn all_data_shards_ready(&self) -> bool {
+        self.slab.all_data_shards_ready()
+    }
+
     /// Abandons the slab whatever state it is in. A pinned slab refuses,
     /// because its shards are already paid for.
     pub(crate) fn cancel(&mut self) -> bool {
@@ -121,28 +100,22 @@ impl SlabTracker {
         self.served.contains(host)
     }
 
-    /// Records one produced shard. Returns false when the index is outside the
-    /// slab, the shard is already there, or the slab no longer takes data.
-    pub(crate) fn push(&mut self, index: usize, data: Bytes) -> bool {
-        if index >= self.shards.len() || self.shards[index].is_some() {
+    /// Records one produced shard. A data shard also marks the slab's input, so
+    /// the encoder's trigger is a fact about the slab rather than a count kept
+    /// beside it. A parity shard has no input fact to record.
+    pub(crate) fn add_shard(&mut self, index: usize, data: Bytes) -> bool {
+        if index >= self.sectors.len() {
             return false;
         }
         if index < self.seed.min_shards as usize {
-            if self.slab.add_data_shard(index, data.clone()).is_err() {
-                return false;
-            }
-            if self.slab.all_data() && self.slab.state() == SlabState::Open {
-                // Every data shard is in, so the slab's bytes are fixed and the
-                // encoder may read them.
-                let _ = self.slab.freeze();
-            }
+            return self.slab.add_data_shard(index, data).is_ok();
         }
-        self.shards[index] = Some(data);
-        true
+        self.slab.state() == SlabState::Open
     }
 
-    /// Records a placed shard. Returns false when the shard was already
-    /// recorded, so a duplicate report cannot advance the slab.
+    /// Records a placed shard. Data and parity land here alike. Returns false
+    /// when the shard was already recorded, so a duplicate report cannot advance
+    /// the slab.
     pub(crate) fn record(
         &mut self,
         shard: usize,
@@ -151,9 +124,6 @@ impl SlabTracker {
     ) -> bool {
         if shard >= self.sectors.len() || self.sectors[shard].is_some() {
             return false;
-        }
-        if self.slab.state() == SlabState::Frozen {
-            let _ = self.slab.begin_placing();
         }
         if self.slab.shard_placed(shard).is_err() {
             return false;
@@ -169,12 +139,9 @@ impl SlabTracker {
             return None;
         }
         let sectors: Option<Vec<SectorPinParams>> = self.sectors.into_iter().collect();
-        let shards: Option<Vec<Bytes>> = self.shards.into_iter().collect();
         Some(FinishedSlab {
             id: self.slab.id(),
-            order: self.order,
             seed: self.seed.clone(),
-            shards: shards?,
             pin: SlabPinParams {
                 version: SlabVersion::V1,
                 encryption_key: self.seed.encryption_key,
@@ -189,8 +156,8 @@ impl SlabTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use crate::Sector;
+    use chrono::Utc;
     use sia_core::signing::PrivateKey;
     use sia_core::types::Hash256;
 
@@ -220,13 +187,13 @@ mod tests {
     /// its own.
     fn produced(count: usize) -> SlabTracker {
         let id = SlabId(1);
-        // Every shard is a data shard here, so the slab freezes as soon as they
-        // are all in and the test can go straight to placement.
+        // Every shard is a data shard here, so the slab is ready for parity as
+        // soon as they are all in and the test can go straight to placement.
         let mut header = seed();
         header.min_shards = count as u8;
-        let mut tracker = SlabTracker::open(id, 0, header, count);
+        let mut tracker = SlabTracker::open(id, header, count);
         for index in 0..count {
-            assert!(tracker.push(index, Bytes::from(vec![index as u8; 8])));
+            assert!(tracker.add_shard(index, Bytes::from(vec![index as u8; 8])));
         }
         tracker
     }
@@ -264,33 +231,31 @@ mod tests {
 
     #[test]
     fn a_produced_shard_twice_is_refused() {
-        let mut slab = SlabTracker::open(SlabId(1), 0, seed(), 30);
-        assert!(slab.push(0, Bytes::from_static(b"one")));
-        assert!(!slab.push(0, Bytes::from_static(b"two")), "duplicate");
-        assert!(!slab.push(30, Bytes::from_static(b"far")), "out of range");
-    }
-
-    #[test]
-    fn a_slab_freezes_once_its_data_shards_are_in() {
-        let mut slab = SlabTracker::open(SlabId(1), 0, seed(), 30);
-        for index in 0..9 {
-            assert!(slab.push(index, Bytes::from(vec![index as u8; 8])));
-            assert_eq!(slab.state(), SlabState::Open, "nine of ten is not data");
-        }
-        assert!(slab.push(9, Bytes::from(vec![9u8; 8])));
-        assert_eq!(slab.state(), SlabState::Frozen, "ten of ten freezes");
+        let mut slab = SlabTracker::open(SlabId(1), seed(), 30);
+        assert!(slab.add_shard(0, Bytes::from_static(b"one")));
         assert!(
-            !slab.push(3, Bytes::from(vec![3u8; 8])),
-            "a frozen slab takes no more data"
+            !slab.add_shard(0, Bytes::from_static(b"two")),
+            "duplicate"
+        );
+        assert!(
+            !slab.add_shard(30, Bytes::from_static(b"far")),
+            "not a data shard"
         );
     }
 
     #[test]
-    fn placing_starts_at_the_first_placed_shard() {
-        let mut slab = produced(2);
-        assert_eq!(slab.state(), SlabState::Frozen);
-        slab.record(0, key(1), sector(key(1)));
-        assert_eq!(slab.state(), SlabState::Placing);
+    fn parity_is_ready_once_the_data_shards_are_in() {
+        let mut slab = SlabTracker::open(SlabId(1), seed(), 30);
+        for index in 0..9 {
+            assert!(slab.add_shard(index, Bytes::from(vec![index as u8; 8])));
+            assert!(!slab.all_data_shards_ready(), "nine of ten is not data");
+        }
+        assert!(slab.add_shard(9, Bytes::from(vec![9u8; 8])));
+        assert!(slab.all_data_shards_ready(), "ten of ten is ready");
+        assert!(
+            slab.record(9, key(1), sector(key(1))),
+            "a shard that exists is placed without waiting for parity"
+        );
     }
 
     #[test]
@@ -309,12 +274,11 @@ mod tests {
         slab.record(0, key(1), sector(key(1)));
         let finished = slab.finish().expect("every shard is in");
         assert_eq!(finished.id, SlabId(1));
-        assert_eq!(finished.shards.len(), 2, "the shards come back for a retry");
         assert_eq!(finished.pin.min_shards, 2, "every shard is data in this fixture");
         assert_eq!(finished.pin.sectors.len(), 2);
         assert_eq!(finished.pin.sectors[0].sector.host_key, key(1));
         assert_eq!(finished.pin.sectors[1].sector.host_key, key(2));
-        assert_eq!(finished.slab.state(), SlabState::Placing);
+        assert_eq!(finished.slab.state(), SlabState::Open);
     }
 
     #[test]

@@ -105,7 +105,7 @@ pub use slabs::{
     Object, ObjectEvent, ObjectEventSummary, ObjectSummary, SealedObject, SealedObjectError,
     Sector, Slab, SlabVersion,
 };
-pub use upload::{PackedUpload, UploadError};
+pub use upload::{CancelHandle, PackedUpload, UploadError};
 
 /// A unique identifier for an indexer application. It should be constant for an application.
 pub type AppID = Hash256;

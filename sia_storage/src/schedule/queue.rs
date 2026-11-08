@@ -27,7 +27,6 @@ pub(crate) struct RequestQueue {
     slabs: HashMap<SlabId, SlabTracker>,
     pending: Vec<ShardRequest>,
     next_slab: u64,
-    next_order: u64,
 }
 
 impl RequestQueue {
@@ -40,9 +39,7 @@ impl RequestQueue {
     pub(crate) fn open_slab(&mut self, seed: SlabSeed, total: usize) -> SlabId {
         self.next_slab += 1;
         let id = SlabId(self.next_slab);
-        let order = self.next_order;
-        self.next_order += 1;
-        self.slabs.insert(id, SlabTracker::open(id, order, seed, total));
+        self.slabs.insert(id, SlabTracker::open(id, seed, total));
         id
     }
 
@@ -53,7 +50,7 @@ impl RequestQueue {
         let Some(slab) = self.slabs.get_mut(&id) else {
             return false;
         };
-        if !slab.push(index, data.clone()) {
+        if !slab.add_shard(index, data.clone()) {
             return false;
         }
         self.pending.push(ShardRequest {
@@ -62,17 +59,6 @@ impl RequestQueue {
             data,
         });
         true
-    }
-
-    /// Puts a slab back for another upload attempt, keeping its id and order so
-    /// the caller's bookkeeping does not move. Used when the indexer rejects a
-    /// slab as stale: the same bytes go out again rather than being re-encoded.
-    pub(crate) fn readd_slab(&mut self, id: SlabId, order: u64, shards: Vec<Bytes>, seed: SlabSeed) {
-        self.slabs
-            .insert(id, SlabTracker::new(id, order, seed, shards.clone()));
-        for (shard, data) in shards.into_iter().enumerate() {
-            self.pending.push(ShardRequest { slab: id, shard, data });
-        }
     }
 
     /// The best shard `host` may write, or `None` so the caller can park.
@@ -87,10 +73,10 @@ impl RequestQueue {
             let Some(slab) = self.slabs.get(&request.slab) else {
                 continue;
             };
-            if slab.has_served(host) {
+            if slab.state() != crate::upload::slab::SlabState::Open || slab.has_served(host) {
                 continue;
             }
-            let rank = (slab.remaining(), slab.order());
+            let rank = (slab.remaining(), request.slab.0);
             let better = match best {
                 None => true,
                 Some((remaining, order, _)) => {
@@ -142,6 +128,14 @@ impl RequestQueue {
                 None => false,
             }
         })
+    }
+
+    /// Whether every data shard of the slab is in, which is when parity may be
+    /// produced.
+    pub(crate) fn slab_ready_for_parity(&self, id: SlabId) -> bool {
+        self.slabs
+            .get(&id)
+            .is_some_and(|slab| slab.all_data_shards_ready())
     }
 
     pub(crate) fn pending(&self) -> usize {
@@ -407,32 +401,5 @@ mod tests {
         assert_eq!(place(&mut queue, host, &request), None, "the slab is gone");
     }
 
-    #[test]
-    fn a_stale_slab_goes_back_with_its_own_id() {
-        let mut queue = RequestQueue::new();
-        let slab = add(&mut queue, 2);
 
-        // Place both shards so the slab finishes and is handed back.
-        let first = queue.take(&key(1)).unwrap();
-        place(&mut queue, key(1), &first);
-        let second = queue.take(&key(2)).unwrap();
-        let finished = queue
-            .placed(&key(2), &second, sector(key(2)))
-            .expect("the second shard completes it");
-        assert_eq!(finished.id, slab);
-        assert_eq!(finished.shards.len(), 2, "the bytes come back for the retry");
-
-        // The indexer rejected it as stale, so the same shards go out again and
-        // the id does not move, which keeps the caller's slot correct.
-        queue.readd_slab(finished.id, finished.order, finished.shards, finished.seed);
-        assert_eq!(queue.pending(), 2);
-        assert_eq!(queue.open_slabs(), 1);
-
-        let retry_a = queue.take(&key(3)).unwrap();
-        assert_eq!(retry_a.slab, slab);
-        place(&mut queue, key(3), &retry_a);
-        let retry_b = queue.take(&key(4)).unwrap();
-        let again = place(&mut queue, key(4), &retry_b);
-        assert_eq!(again, Some(slab), "the retry finishes under the same id");
-    }
 }
