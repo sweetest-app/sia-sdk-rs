@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 #[cfg(feature = "fs")]
 use std::path::Path;
@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::app_client::{self, SlabPinParams};
 use crate::congestion::{InflightController, SamplePermit};
 use crate::encryption::{EncryptionKey, encrypt_shard};
+use crate::schedule::SlabId;
 use crate::erasure_coding::{self, ErasureCoder, ReadSlab, SlabReader};
 use crate::hosts::{QueueError, RPCError};
 #[cfg(test)]
@@ -22,10 +23,18 @@ use log::debug;
 use sia_core::signing::PublicKey;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 
 pub(crate) mod slab;
 mod worker;
+
+/// How many slabs may be encoding parity at once. Two keeps the encoder ahead of
+/// the writers while bounding the plaintext it holds to two slabs.
+const ENCODERS_IN_FLIGHT: usize = 2;
+/// Parity shards produced per pass over a slab. Five holds 20 MiB of output and
+/// reads the slab four times, which is the balance measured in
+/// docs/upload-bytes.md.
+const PARITY_BATCH: usize = 5;
 
 const INITIAL_INFLIGHT: usize = 8;
 const MIN_INFLIGHT: usize = 2;
@@ -227,6 +236,39 @@ const MAX_PIN_RETRIES: usize = 3;
 /// Delay before the first pin retry. It doubles on each subsequent attempt.
 const PIN_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// Produces `count` shards starting at `first` from the plaintext data shards.
+///
+/// This is the encoder helper the coordinator calls: it returns the batch's
+/// buffers, so the caller holds only the batch, never the whole slab.
+fn encode_batch(
+    coder: &ErasureCoder,
+    plain: &[Bytes],
+    first: usize,
+    count: usize,
+    size: usize,
+) -> Result<Vec<Vec<u8>>, UploadError> {
+    let mut out: Vec<Vec<u8>> = (0..count).map(|_| vec![0u8; size]).collect();
+    {
+        let inputs: Vec<&[u8]> = plain.iter().map(|shard| &shard[..]).collect();
+        let mut outputs: Vec<&mut [u8]> = out.iter_mut().map(|s| s.as_mut_slice()).collect();
+        slab::Encoder::encode_range(coder, &inputs, first, &mut outputs)
+            .map_err(UploadError::InvalidOptions)?;
+    }
+    Ok(out)
+}
+
+impl slab::Encoder for ErasureCoder {
+    fn encode_range(
+        &self,
+        data: &[&[u8]],
+        first_shard: usize,
+        outputs: &mut [&mut [u8]],
+    ) -> Result<(), String> {
+        ErasureCoder::encode_range(self, data, first_shard, outputs)
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Pins a freshly uploaded slab to the indexer, retrying transient errors.
 async fn pin_uploaded_slab(
     api_client: &app_client::Client,
@@ -272,9 +314,25 @@ pub(crate) struct Upload {
     erasure_coder: Arc<ErasureCoder>,
     total_shards: usize,
     slab_buffer: Option<SlabReader>,
+    /// Plaintext of the slabs whose data shards are arriving or being encoded.
+    /// Held only until the last parity batch is produced, so memory is bounded by
+    /// `ENCODERS_IN_FLIGHT` slabs of data rather than by encoded slabs.
+    open: HashMap<SlabId, OpenSlab>,
+    /// Slabs encoding parity right now, at most `ENCODERS_IN_FLIGHT`.
+    encoders: Arc<Semaphore>,
     /// The worker pool and the request queue. A slab is registered here once it
     /// is encoded, and a connected host pulls its shards.
     state: Arc<worker::WorkerState>,
+}
+
+/// A slab whose data shards are arriving or whose parity is being produced.
+struct OpenSlab {
+    key: EncryptionKey,
+    /// The data shards in the clear, which is what the encoder reads.
+    plain: Vec<Option<Bytes>>,
+    /// Set once the encoder has been started, so the tenth shard cannot start it
+    /// twice.
+    started: bool,
 }
 
 impl Upload {
@@ -318,6 +376,8 @@ impl Upload {
             )),
             erasure_coder: Arc::new(erasure_coder),
             total_shards,
+            open: HashMap::new(),
+            encoders: Arc::new(Semaphore::new(ENCODERS_IN_FLIGHT)),
             state,
         })
     }
@@ -334,60 +394,114 @@ impl Upload {
     /// across all [read](Self::read) calls, including bytes from reads that
     /// errored part-way. Callers can diff this across a call to recover a
     /// partial count on error and treat the bytes as dead padding.
-    /// Encodes and encrypts a filled slab, then hands its shards to the workers.
+    /// Encodes and queues a filled slab's shards.
+    ///
+    /// The data shards go out immediately because they need no arithmetic. Parity
+    /// is produced in batches of `PARITY_BATCH` by an encoder task, so the slab is
+    /// never held whole: memory is the plaintext of the slabs encoding right now,
+    /// which is `ENCODERS_IN_FLIGHT` of them.
     ///
     /// Nothing is assigned to a host here. The schedule holds the shards, and a
     /// connected host pulls the next one it is allowed to write, which is what
     /// lets a host keep working across slabs instead of being spent on one.
-    async fn register_slab(&mut self, slab: ReadSlab) -> Result<(), UploadError> {
-        // Bound how many slabs hold shard memory. The slot comes back when the
-        // slab is pinned, so the ceiling is slabs in flight, not shards.
-        while !self.state.slack_available() {
-            let notified = self.state.slot_notify();
-            if self.state.slack_available() {
-                break;
-            }
-            notified.await;
-        }
-        self.state.take_slot();
-
-        let min_shards = self.erasure_coder.data_shards() as u8;
-        let length = slab.length as u32;
-        let encryption_key = slab.encryption_key.clone();
-        let rs = self.erasure_coder.clone();
-        let mut shards = slab.shards;
-        let started = Instant::now();
-        let shards = maybe_spawn_blocking!({
-            rs.encode_shards(&mut shards)?;
-            Ok::<_, UploadError>(shards)
-        })?;
-        debug!("slab encoded in {:?}", started.elapsed());
-
-        let owned_slab_key = Arc::new(encryption_key.clone());
-        let mut encrypted: Vec<Bytes> = Vec::with_capacity(shards.len());
-        for (index, mut shard) in shards.into_iter().enumerate() {
-            let key = owned_slab_key.clone();
-            let data = maybe_spawn_blocking!({
-                encrypt_shard(&key, index as u8, 0, &mut shard);
-                Bytes::from(shard)
-            });
-            encrypted.push(data);
-        }
-
-        let id = self.state.open_slab(
-            crate::schedule::SlabSeed {
-                encryption_key,
-                length,
-                min_shards,
+    fn register_slab(&mut self, slab: ReadSlab) -> Result<(), UploadError> {
+        let min_shards = self.erasure_coder.data_shards();
+        let key = slab.encryption_key;
+        let seed = crate::schedule::SlabSeed {
+            encryption_key: key.clone(),
+            length: slab.length as u32,
+            min_shards: min_shards as u8,
+        };
+        let id = self.state.open_slab(seed, self.total_shards);
+        self.open.insert(
+            id,
+            OpenSlab {
+                key,
+                plain: vec![None; min_shards],
+                started: false,
             },
-            encrypted.len(),
         );
-        for (index, data) in encrypted.into_iter().enumerate() {
-            self.state.add_shard(id, index, data);
+        for (index, shard) in slab.shards.into_iter().take(min_shards).enumerate() {
+            self.add_data_shard(id, index, Bytes::from(shard))?;
         }
+        Ok(())
+    }
+
+    /// Queues one data shard, and starts the encoder once the last one is in.
+    fn add_data_shard(
+        &mut self,
+        id: SlabId,
+        index: usize,
+        plain: Bytes,
+    ) -> Result<(), UploadError> {
+        let data_shards = self.erasure_coder.data_shards();
+        let Some(open) = self.open.get_mut(&id) else {
+            return Err(UploadError::InvalidOptions(format!(
+                "slab {} is not open",
+                id.0
+            )));
+        };
+        if index >= data_shards || open.plain[index].is_some() {
+            return Err(UploadError::InvalidOptions(format!(
+                "data shard {index} of slab {} is not expected",
+                id.0
+            )));
+        }
+        open.plain[index] = Some(plain.clone());
+        let key = open.key.clone();
+
+        // A data shard needs no encoding, so it can be written while the parity
+        // for the rest of the slab is still being produced.
+        let mut shard = plain.to_vec();
+        encrypt_shard(&key, index as u8, 0, &mut shard);
+        self.state.add_shard(id, index, Bytes::from(shard));
         worker::ensure_workers(&self.state);
         self.state.notify_work();
+
+        let ready = open.plain.iter().all(Option::is_some);
+        if ready && !open.started {
+            open.started = true;
+            let plain: Vec<Bytes> = open.plain.iter().flatten().cloned().collect();
+            self.spawn_encoder(id, key, plain);
+        }
         Ok(())
+    }
+
+    /// Produces the slab's parity shards in batches, two slabs at a time.
+    fn spawn_encoder(&self, id: SlabId, key: EncryptionKey, plain: Vec<Bytes>) {
+        let state = self.state.clone();
+        let coder = self.erasure_coder.clone();
+        let slots = self.encoders.clone();
+        let data_shards = self.erasure_coder.data_shards();
+        let total = self.total_shards;
+        maybe_spawn!(async move {
+            let encoded: Result<(), UploadError> = async {
+                let _permit = slots.acquire().await;
+                let started = Instant::now();
+                for first in (data_shards..total).step_by(PARITY_BATCH) {
+                    let count = PARITY_BATCH.min(total - first);
+                    let size = plain[0].len();
+                    let batch_coder = coder.clone();
+                    let batch_plain = plain.clone();
+                    let mut out = maybe_spawn_blocking!({
+                        encode_batch(&batch_coder, &batch_plain, first, count, size)
+                    })?;
+                    for (offset, shard) in out.iter_mut().enumerate() {
+                        encrypt_shard(&key, (first + offset) as u8, 0, shard);
+                    }
+                    for (offset, shard) in out.into_iter().enumerate() {
+                        state.add_shard(id, first + offset, Bytes::from(shard));
+                    }
+                    state.notify_work();
+                }
+                debug!("[upload] slab {} encoded in {:?}", id.0, started.elapsed());
+                Ok(())
+            }
+            .await;
+            if let Err(error) = encoded {
+                debug!("[upload] slab {} could not be encoded: {error}", id.0);
+            }
+        });
     }
 
     pub(crate) fn length(&self) -> u64 {
@@ -420,7 +534,7 @@ impl Upload {
             total_length += n as u64;
 
             if let Some(slab) = slab {
-                self.register_slab(slab).await?;
+                self.register_slab(slab)?;
             }
         }
     }
@@ -431,7 +545,7 @@ impl Upload {
         let last_slab = self.slab_buffer.take().unwrap().finish();
         if let Some(slab) = last_slab {
             self.ensure_hosts().await?;
-            self.register_slab(slab).await?;
+            self.register_slab(slab)?;
         }
         loop {
             let total = self.state.registered();

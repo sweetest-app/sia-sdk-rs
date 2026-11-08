@@ -42,6 +42,18 @@ impl ErasureCoder {
         Ok(())
     }
 
+    /// Encodes a range of shards from the data shards, without holding the
+    /// whole slab of outputs. Used to produce parity in batches.
+    pub fn encode_range(
+        &self,
+        data: &[&[u8]],
+        first_shard: usize,
+        outputs: &mut [&mut [u8]],
+    ) -> Result<()> {
+        self.encoder.encode_range(data, first_shard, outputs)?;
+        Ok(())
+    }
+
     /// reconstructs the missing datashards from the available ones.
     pub fn reconstruct_data_shards(&self, shards: &mut [Option<Vec<u8>>]) -> Result<()> {
         self.encoder.reconstruct_data(shards)?;
