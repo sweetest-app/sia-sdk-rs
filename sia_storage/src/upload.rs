@@ -8,7 +8,7 @@ use crate::app_client::{self, SlabPinParams};
 use crate::congestion::{InflightController, SamplePermit};
 use crate::encryption::{EncryptionKey, encrypt_shard};
 use crate::schedule::SlabId;
-use crate::erasure_coding::{self, ErasureCoder, ReadSlab, SlabReader};
+use crate::erasure_coding::{self, ErasureCoder, SlabReader};
 use crate::hosts::{QueueError, RPCError};
 #[cfg(test)]
 use crate::slabs::SlabVersion;
@@ -46,7 +46,11 @@ const MIN_INFLIGHT: usize = 2;
 /// The ceiling the inflight controller may raise to, in shards. It is not a
 /// window: a slab is only held while a batch of its shards is being produced, so
 /// this bounds write concurrency rather than memory.
-const MAX_INFLIGHT: usize = 90;
+/// The ceiling the inflight controller may raise to, in shards. Sixteen keeps the
+/// streams that share the uplink few enough that each keeps making progress: with
+/// ninety allowed, a 4 MiB write can go six seconds without a byte and the host
+/// closes the stream as idle.
+const MAX_INFLIGHT: usize = 16;
 
 /// Gates concurrent shard uploads at the [`InflightController`]'s current
 /// limit. Replaces a fixed semaphore so the limit can adapt while uploads are
@@ -377,10 +381,7 @@ impl Upload {
         Ok(Self {
             client,
             app_key,
-            slab_buffer: Some(SlabReader::new(
-                options.data_shards as usize,
-                options.parity_shards as usize,
-            )),
+            slab_buffer: Some(SlabReader::new(options.data_shards as usize)),
             erasure_coder: Arc::new(erasure_coder),
             total_shards,
             open: HashMap::new(),
@@ -411,12 +412,19 @@ impl Upload {
     /// Nothing is assigned to a host here. The schedule holds the shards, and a
     /// connected host pulls the next one it is allowed to write, which is what
     /// lets a host keep working across slabs instead of being spent on one.
-    async fn register_slab(&mut self, slab: ReadSlab) -> Result<(), UploadError> {
+    /// Opens a slab for shards that will arrive one at a time, after waiting for
+    /// the queue to have room.
+    pub(crate) async fn open_data_slab(
+        &mut self,
+        encryption_key: EncryptionKey,
+        length: usize,
+    ) -> Result<Option<SlabId>, UploadError> {
         // Do not read another slab while the queue is full: the shards of a slab are
         // the memory, so waiting for a host here is what bounds it.
         while self.state.queued() > QUEUE_HIGH_WATER {
             if self.state.is_closed() {
-                return Ok(());
+                // Cancelled while waiting for room: nothing more is opened.
+                return Ok(None);
             }
             sleep(Duration::from_millis(50)).await;
         }
@@ -426,10 +434,10 @@ impl Upload {
             self.state.queued(),
             self.open.len(),
         );
-        let key = slab.encryption_key;
+        let key = encryption_key;
         let seed = crate::schedule::SlabSeed {
             encryption_key: key.clone(),
-            length: slab.length as u32,
+            length: length as u32,
             min_shards: min_shards as u8,
         };
         let id = self.state.open_slab(seed, self.total_shards);
@@ -441,14 +449,11 @@ impl Upload {
                 started: false,
             },
         );
-        for (index, shard) in slab.shards.into_iter().take(min_shards).enumerate() {
-            self.add_data_shard(id, index, Bytes::from(shard))?;
-        }
-        Ok(())
+        Ok(Some(id))
     }
 
     /// Queues one data shard, and starts the encoder once the last one is in.
-    fn add_data_shard(
+    pub(crate) fn add_data_shard(
         &mut self,
         id: SlabId,
         index: usize,
@@ -563,7 +568,12 @@ impl Upload {
             total_length += n as u64;
 
             if let Some(slab) = slab {
-                self.register_slab(slab).await?;
+                let Some(id) = self.open_data_slab(slab.encryption_key, slab.length).await? else {
+                    return Ok(total_length);
+                };
+                for (index, shard) in slab.shards.into_iter().enumerate() {
+                    self.add_data_shard(id, index, Bytes::from(shard))?;
+                }
             }
         }
     }
@@ -574,7 +584,11 @@ impl Upload {
         let last_slab = self.slab_buffer.take().unwrap().finish();
         if let Some(slab) = last_slab {
             self.ensure_hosts().await?;
-            self.register_slab(slab).await?;
+            if let Some(id) = self.open_data_slab(slab.encryption_key, slab.length).await? {
+                for (index, shard) in slab.shards.into_iter().enumerate() {
+                    self.add_data_shard(id, index, Bytes::from(shard))?;
+                }
+            }
         }
         loop {
             let total = self.state.registered();
@@ -784,6 +798,35 @@ impl PackedUpload {
     /// in flight, so a caller can compose and pin finished files while the
     /// upload keeps running instead of waiting for
     /// [finalize](Self::finalize).
+    /// Opens a slab for shards that arrive one at a time, and returns its id.
+    /// `0` means the upload was cancelled before a slot was free.
+    ///
+    /// The caller sends the `data_shards` data shards with
+    /// [`add_shard`](Self::add_shard); the encoder produces the parity shards
+    /// from them, so nothing here needs a whole encoded slab.
+    pub async fn register_slab(&mut self, length: u64) -> Result<u64, UploadError> {
+        Ok(
+            match self
+                .upload
+                .open_data_slab(self.data_key.clone(), length as usize)
+                .await?
+            {
+                Some(id) => id.0,
+                None => 0,
+            },
+        )
+    }
+
+    /// Queues one data shard of a slab opened with
+    /// [`register_slab`](Self::register_slab).
+    pub fn add_shard(&mut self, slab: u64, index: usize, data: &[u8]) -> Result<(), UploadError> {
+        self.upload.add_data_shard(
+            crate::schedule::SlabId(slab),
+            index,
+            Bytes::copy_from_slice(data),
+        )
+    }
+
     pub fn ready_objects(&self) -> Vec<Option<Object>> {
         let pinned = self.upload.pinned_slabs();
         let optimal_data_size = self.optimal_data_size() as u64;
@@ -1255,6 +1298,42 @@ mod tests {
     }
 
     #[sia_core_derive::cross_target_test]
+    async fn test_no_shard_is_queued_after_cancel() {
+        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
+        hosts.update(
+            (0..30)
+                .map(|_| test_host(PrivateKey::from_seed(&rand::random()).public_key()))
+                .collect(),
+            true,
+        );
+        let mut upload = Upload::new(
+            hosts,
+            app_client::Client::mock(),
+            Arc::new(AppKey::import(rand::random())),
+            UploadOptions::default(),
+        )
+        .unwrap();
+        upload.ensure_hosts().await.unwrap();
+        let id = upload
+            .open_data_slab(EncryptionKey::from([3u8; 32]), 4096)
+            .await
+            .unwrap()
+            .expect("a slab opens while the upload is live");
+
+        upload.state.shutdown();
+        let before = upload.state.queued();
+        for index in 0..10 {
+            let _ = upload.add_data_shard(id, index, Bytes::from(vec![0u8; 4096]));
+        }
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            upload.state.queued(),
+            before,
+            "a cancelled upload queues nothing, and the encoder produces no parity"
+        );
+    }
+
+    #[sia_core_derive::cross_target_test]
     async fn test_dropping_an_upload_cancels_it() {
         let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
         hosts.update(
@@ -1276,6 +1355,39 @@ mod tests {
         assert!(!state.is_closed(), "an upload in flight is open");
         drop(packed);
         assert!(state.is_closed(), "dropping the upload cancels it");
+    }
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_shards_can_be_added_one_at_a_time() {
+        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
+        hosts.update(
+            (0..30)
+                .map(|_| test_host(PrivateKey::from_seed(&rand::random()).public_key()))
+                .collect(),
+            true,
+        );
+        let mut packed = PackedUpload::new(
+            hosts.clone(),
+            app_client::Client::mock(),
+            Arc::new(AppKey::import(rand::random())),
+            PackedUploadOptions::default(),
+        )
+        .unwrap();
+
+        let id = packed.register_slab(4096).await.unwrap();
+        assert_ne!(id, 0, "a slab opens and has an id");
+        let shard = vec![7u8; 4096];
+        for index in 0..10 {
+            packed.add_shard(id, index, &shard).unwrap();
+        }
+
+        // The ten data shards are queued immediately; the encoder adds parity from
+        // them. Nothing waits for a whole encoded slab to exist first.
+        assert!(
+            packed.upload.state.queued() >= 10,
+            "the data shards are queued as they arrive"
+        );
+        drop(packed);
     }
 
     #[sia_core_derive::cross_target_test]

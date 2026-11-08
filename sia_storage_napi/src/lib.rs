@@ -467,7 +467,6 @@ impl SendableCallback<ShardAttemptInfo> {
 #[napi(object, object_to_js = false)]
 #[derive(Default)]
 pub struct UploadOptions {
-    pub max_buffered_slabs: Option<u32>,
     pub data_shards: Option<u8>,
     pub parity_shards: Option<u8>,
     pub start_offset: Option<BigInt>,
@@ -484,7 +483,6 @@ impl TryFrom<UploadOptions> for sia_storage::UploadOptions {
         let mut options = sia_storage::UploadOptions::default();
         options.data_shards = val.data_shards.unwrap_or(options.data_shards);
         options.parity_shards = val.parity_shards.unwrap_or(options.parity_shards);
-        options.max_buffered_slabs = val.max_buffered_slabs.map(|v| v as usize);
         options.shard_uploaded = val.on_shard_uploaded.map(|cb| cb.into_shard_callback());
         options.shard_attempt = val.on_shard_attempted.map(|cb| cb.into_attempt_callback());
         if let Some(start_offset) = val.start_offset {
@@ -518,7 +516,6 @@ impl FromNapiValue for SendableUploadOptions {
 #[napi(object, object_to_js = false)]
 #[derive(Default)]
 pub struct PackedUploadOptions {
-    pub max_buffered_slabs: Option<u32>,
     pub data_shards: Option<u8>,
     pub parity_shards: Option<u8>,
     #[napi(ts_type = "(progress: ShardProgress) => void")]
@@ -532,7 +529,6 @@ impl From<PackedUploadOptions> for sia_storage::PackedUploadOptions {
         let mut options = sia_storage::PackedUploadOptions::default();
         options.data_shards = val.data_shards.unwrap_or(options.data_shards);
         options.parity_shards = val.parity_shards.unwrap_or(options.parity_shards);
-        options.max_buffered_slabs = val.max_buffered_slabs.map(|v| v as usize);
         options.shard_uploaded = val.on_shard_uploaded.map(|cb| cb.into_shard_callback());
         options.shard_attempt = val.on_shard_attempted.map(|cb| cb.into_attempt_callback());
         options

@@ -139,12 +139,13 @@ async fn fill_buf<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> io::Result
 }
 
 impl SlabReader {
-    pub(crate) fn new(data_shards: usize, parity_shards: usize) -> Self {
-        let total_shards = data_shards + parity_shards;
+    pub(crate) fn new(data_shards: usize) -> Self {
         Self {
             data_shards,
             encryption_key: rand::random::<[u8; 32]>().into(),
-            shards: vec![vec![0u8; SECTOR_SIZE]; total_shards],
+            // Only the data shards are held: parity is produced from these by the
+            // encoder, in batches, so a slab never sits here as 120 MiB.
+            shards: vec![vec![0u8; SECTOR_SIZE]; data_shards],
             read_buffer: vec![0u8; READ_BUFFER_SIZE],
             length: 0,
             total_length: 0,
@@ -326,7 +327,6 @@ mod tests {
     #[sia_core_derive::cross_target_test]
     async fn test_striped_read() {
         const DATA_SHARDS: usize = 3;
-        const PARITY_SHARDS: usize = 2;
         const SLAB_SIZE: usize = SECTOR_SIZE * DATA_SHARDS;
 
         let test_cases = vec![
@@ -341,7 +341,7 @@ mod tests {
             getrandom::fill(&mut data).unwrap();
 
             let data_key = EncryptionKey::from([7u8; 32]);
-            let mut reader = SlabReader::new(DATA_SHARDS, PARITY_SHARDS);
+            let mut reader = SlabReader::new(DATA_SHARDS);
             let (n, slab) = reader
                 .read_slab(data_key.clone(), &mut Cursor::new(data.clone()))
                 .await
@@ -364,8 +364,8 @@ mod tests {
             assert_eq!(size, expected_size, "data size {data_size} mismatch");
             assert_eq!(
                 shards.len(),
-                DATA_SHARDS + PARITY_SHARDS,
-                "data size {data_size} shard count mismatch"
+                DATA_SHARDS,
+                "the reader returns the data shards; parity is produced later"
             );
 
             for (i, data) in data[..size].chunks(64).enumerate() {
@@ -397,7 +397,7 @@ mod tests {
         let data = Bytes::from(data);
 
         let data_key = EncryptionKey::from([7u8; 32]);
-        let mut reader = SlabReader::new(DATA_SHARDS, PARITY_SHARDS);
+        let mut reader = SlabReader::new(DATA_SHARDS);
         let (n, slab) = reader
             .read_slab(data_key.clone(), &mut Cursor::new(data.clone()))
             .await
@@ -416,10 +416,9 @@ mod tests {
         );
         assert_eq!(size, data.len());
 
-        // we expect 5 shards and the last one is an empty parity shard
-        assert_eq!(shards.len(), 5);
+        // the reader returns only the data shards; parity is produced later
+        assert_eq!(shards.len(), 4);
         assert_eq!(size, SECTOR_SIZE * 7 / 2);
-        assert_eq!(shards[4], vec![0u8; SECTOR_SIZE]); // parity shard should be empty
 
         for shard in &shards[..4] {
             // every shard should be of SECTOR_SIZE
@@ -450,10 +449,10 @@ mod tests {
             assert_eq!(shard[SECTOR_SIZE / 8 * 7..], [0u8; SECTOR_SIZE / 8]);
         }
 
-        // encoding the read shards should succeed without errors and cause the
-        // parity shard to be filled
+        // encoding the data shards should fill a parity buffer
+        shards.push(vec![0u8; SECTOR_SIZE]);
         coder.encode_shards(&mut shards).unwrap();
-        assert_ne!(shards[4], vec![0u8; SECTOR_SIZE]);
+        assert_ne!(shards[4], vec![0u8; SECTOR_SIZE], "parity came from the data");
 
         // joining the shards back together should result in the original data
         let shards: Vec<Bytes> = shards.into_iter().map(Bytes::from).collect();

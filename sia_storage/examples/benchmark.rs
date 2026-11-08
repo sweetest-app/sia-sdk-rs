@@ -70,7 +70,6 @@ enum Command {
 
         /// Maximum number of slabs buffered in memory during upload.
         #[arg(long)]
-        upload_max_buffered_slabs: Option<usize>,
 
         /// Maximum number of chunks buffered in memory during download.
         #[arg(long)]
@@ -639,7 +638,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Run {
             size,
             warm,
-            upload_max_buffered_slabs,
             download_max_buffered_chunks,
             host_summary,
             runs,
@@ -647,10 +645,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let sdk = connect(&cli.profile).await?;
 
             // upload the data to the network
-            let upload_options = UploadOptions {
-                max_buffered_slabs: upload_max_buffered_slabs,
-                ..Default::default()
-            };
+            let upload_options = UploadOptions::default();
 
             let download_options = DownloadOptions {
                 max_buffered_chunks: download_max_buffered_chunks,

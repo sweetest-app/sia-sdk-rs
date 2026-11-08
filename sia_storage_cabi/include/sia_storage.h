@@ -173,7 +173,6 @@ typedef struct {
     uint8_t data_shards;
     uint8_t parity_shards;
     bool set_redundancy;
-    uint64_t max_buffered_slabs;
     // Keep `userdata` valid until the transfer handle is freed, or until
     // `sia_upload_finish` or `sia_packed_upload_finalize` consumes the
     // transfer. Those calls wait for active callbacks and prevent later
@@ -195,7 +194,6 @@ typedef struct {
     uint8_t data_shards;
     uint8_t parity_shards;
     bool set_redundancy;
-    uint64_t max_buffered_slabs;
     // Keep `userdata` valid until the transfer handle is freed, or until
     // `sia_packed_upload_finalize` consumes the transfer. Those calls wait
     // for active callbacks and prevent later ones, including on failure or

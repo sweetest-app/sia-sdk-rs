@@ -131,6 +131,11 @@ impl WorkerState {
     /// Queues one produced shard for an open slab. Returns false when the shard
     /// does not belong to the slab or was already produced.
     pub(crate) fn add_shard(&self, id: SlabId, index: usize, data: bytes::Bytes) -> bool {
+        // Placement consults the one cancel signal, so a shard produced after a
+        // cancel is dropped rather than queued for a slab nobody wants.
+        if self.is_closed() {
+            return false;
+        }
         self.queue.lock().unwrap().add_shard(id, index, data)
     }
 

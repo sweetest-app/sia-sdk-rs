@@ -222,7 +222,7 @@ fn classify(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
         return Some(SIA_ERR_NOT_ENOUGH_SHARDS);
     }
     if e.downcast_ref::<QueueError>()
-        .is_some_and(|q| matches!(q, QueueError::NoMoreHosts))
+        .is_some_and(|q| matches!(q, QueueError::InsufficientHosts))
     {
         return Some(SIA_ERR_NO_MORE_HOSTS);
     }

@@ -115,6 +115,36 @@ impl PackedUpload {
         Ok(result? as f64)
     }
 
+    /// Opens a slab for shards that arrive one at a time, and returns its id.
+    /// `0` means the upload was cancelled. Send its data shards with
+    /// [`addShard`](Self::add_shard); the encoder produces parity from them.
+    #[wasm_bindgen(js_name = "registerSlab")]
+    pub async fn register_slab(&self, length: f64) -> Result<f64, JsError> {
+        if self.cancel.is_cancelled() {
+            return Err(JsError::new("upload closed"));
+        }
+        let mut guard = self.inner.lock().await;
+        let mut pu = guard.take().ok_or_else(|| JsError::new("upload closed"))?;
+        let result = pu.register_slab(length as u64).await.map_err(to_js_err);
+        *guard = Some(pu);
+        Ok(result? as f64)
+    }
+
+    /// Queues one data shard of a slab opened with `registerSlab`.
+    #[wasm_bindgen(js_name = "addShard")]
+    pub async fn add_shard(&self, slab: f64, index: f64, data: &[u8]) -> Result<(), JsError> {
+        if self.cancel.is_cancelled() {
+            return Err(JsError::new("upload closed"));
+        }
+        let mut guard = self.inner.lock().await;
+        let mut pu = guard.take().ok_or_else(|| JsError::new("upload closed"))?;
+        let result = pu
+            .add_shard(slab as u64, index as usize, data)
+            .map_err(to_js_err);
+        *guard = Some(pu);
+        result
+    }
+
     /// Finalizes the packed upload and returns the resulting objects.
     /// Each object must be pinned separately with `sdk.pinObject()`.
     pub async fn finalize(&self) -> Result<Vec<PinnedObject>, JsError> {

@@ -28,7 +28,6 @@ fn default_upload_options() -> UploadOptionsC {
         data_shards: 0,
         parity_shards: 0,
         set_redundancy: false,
-        max_buffered_slabs: 0,
         on_shard: None,
         userdata: 0,
         has_start_offset: false,
@@ -41,7 +40,6 @@ fn default_packed_upload_options() -> PackedUploadOptionsC {
         data_shards: 0,
         parity_shards: 0,
         set_redundancy: false,
-        max_buffered_slabs: 0,
         on_shard: None,
         userdata: 0,
     }
@@ -4041,7 +4039,6 @@ fn header_structs_keep_their_layout() {
     assert_eq!(offset_of!(UploadOptionsC, data_shards), 0);
     assert_eq!(offset_of!(UploadOptionsC, parity_shards), 1);
     assert_eq!(offset_of!(UploadOptionsC, set_redundancy), 2);
-    assert_eq!(offset_of!(UploadOptionsC, max_buffered_slabs), 8);
     assert_eq!(offset_of!(UploadOptionsC, on_shard), 16);
     assert_eq!(offset_of!(UploadOptionsC, userdata), 24);
     assert_eq!(offset_of!(UploadOptionsC, has_start_offset), 32);
@@ -4061,7 +4058,6 @@ fn header_structs_keep_their_layout() {
     assert_eq!(offset_of!(PackedUploadOptionsC, data_shards), 0);
     assert_eq!(offset_of!(PackedUploadOptionsC, parity_shards), 1);
     assert_eq!(offset_of!(PackedUploadOptionsC, set_redundancy), 2);
-    assert_eq!(offset_of!(PackedUploadOptionsC, max_buffered_slabs), 8);
     assert_eq!(offset_of!(PackedUploadOptionsC, on_shard), 16);
     assert_eq!(offset_of!(PackedUploadOptionsC, userdata), 24);
 

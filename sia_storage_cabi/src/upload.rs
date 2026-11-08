@@ -49,7 +49,6 @@ pub(crate) struct UploadOptionsC {
     pub(crate) data_shards: u8,
     pub(crate) parity_shards: u8,
     pub(crate) set_redundancy: bool,
-    pub(crate) max_buffered_slabs: u64,
     /// Keep `userdata` valid until the transfer handle is freed, or until
     /// `sia_upload_finish` or `sia_packed_upload_finalize` consumes the
     /// transfer. Those calls wait for active callbacks and prevent later
@@ -72,7 +71,6 @@ pub(crate) struct PackedUploadOptionsC {
     pub(crate) data_shards: u8,
     pub(crate) parity_shards: u8,
     pub(crate) set_redundancy: bool,
-    pub(crate) max_buffered_slabs: u64,
     /// Keep `userdata` valid until the transfer handle is freed, or until
     /// `sia_packed_upload_finalize` consumes the transfer. Those calls wait
     /// for active callbacks and prevent later ones, including on failure or
@@ -121,9 +119,6 @@ pub(crate) fn make_upload_options(c: &UploadOptionsC) -> (UploadOptions, Callbac
         o.data_shards = c.data_shards;
         o.parity_shards = c.parity_shards;
     }
-    if c.max_buffered_slabs > 0 {
-        o.max_buffered_slabs = Some(c.max_buffered_slabs as usize);
-    }
     if c.has_start_offset {
         o.start_offset = Some(c.start_offset);
     }
@@ -139,9 +134,6 @@ pub(crate) fn make_packed_upload_options(
     if c.set_redundancy {
         o.data_shards = c.data_shards;
         o.parity_shards = c.parity_shards;
-    }
-    if c.max_buffered_slabs > 0 {
-        o.max_buffered_slabs = Some(c.max_buffered_slabs as usize);
     }
     let (callback, guard) = progress_callback(c.on_shard, c.userdata);
     o.shard_uploaded = callback;

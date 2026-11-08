@@ -48,7 +48,6 @@ fn upload_benchmark(c: &mut Criterion) {
                     sdk.clone(),
                     input.clone(),
                     UploadOptions {
-                        max_buffered_slabs: Some(90),
                         ..Default::default()
                     },
                 )
@@ -67,7 +66,6 @@ fn upload_benchmark(c: &mut Criterion) {
                     sdk.clone(),
                     input.clone(),
                     UploadOptions {
-                        max_buffered_slabs: Some(10),
                         ..Default::default()
                     },
                 )
