@@ -192,6 +192,11 @@ impl WorkerState {
     }
 
     /// Whether the upload has been stopped.
+    /// Shards waiting for a host.
+    pub(crate) fn queued(&self) -> usize {
+        self.queue.lock().unwrap().pending()
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }

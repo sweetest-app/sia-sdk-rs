@@ -35,6 +35,10 @@ const ENCODERS_IN_FLIGHT: usize = 2;
 /// reads the slab four times, which is the balance measured in
 /// docs/upload-bytes.md.
 const PARITY_BATCH: usize = 5;
+/// How many produced shards may wait for a host before the reader pauses. This is
+/// the backpressure the old buffered-slab window provided: without it the queue
+/// grows as fast as the encoder runs and every shard of the file is held at once.
+const QUEUE_HIGH_WATER: usize = 20;
 
 const INITIAL_INFLIGHT: usize = 8;
 const MIN_INFLIGHT: usize = 2;
@@ -401,8 +405,21 @@ impl Upload {
     /// Nothing is assigned to a host here. The schedule holds the shards, and a
     /// connected host pulls the next one it is allowed to write, which is what
     /// lets a host keep working across slabs instead of being spent on one.
-    fn register_slab(&mut self, slab: ReadSlab) -> Result<(), UploadError> {
+    async fn register_slab(&mut self, slab: ReadSlab) -> Result<(), UploadError> {
+        // Do not read another slab while the queue is full: the shards of a slab are
+        // the memory, so waiting for a host here is what bounds it.
+        while self.state.queued() > QUEUE_HIGH_WATER {
+            if self.state.is_closed() {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
         let min_shards = self.erasure_coder.data_shards();
+        debug!(
+            "[upload] holding {} shards across {} open slabs",
+            self.state.queued(),
+            self.open.len(),
+        );
         let key = slab.encryption_key;
         let seed = crate::schedule::SlabSeed {
             encryption_key: key.clone(),
@@ -536,7 +553,7 @@ impl Upload {
             total_length += n as u64;
 
             if let Some(slab) = slab {
-                self.register_slab(slab)?;
+                self.register_slab(slab).await?;
             }
         }
     }
@@ -547,7 +564,7 @@ impl Upload {
         let last_slab = self.slab_buffer.take().unwrap().finish();
         if let Some(slab) = last_slab {
             self.ensure_hosts().await?;
-            self.register_slab(slab)?;
+            self.register_slab(slab).await?;
         }
         loop {
             let total = self.state.registered();
