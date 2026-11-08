@@ -209,6 +209,13 @@ impl Slab {
     }
 }
 
+/// The slab's data shards, which is what the encoder reads. The source helper:
+/// the coordinator never reaches into a slab for its bytes itself.
+/// Clones are pointer copies: `Bytes` is reference counted.
+pub(crate) trait ShardSource {
+    fn data_shards(&self) -> Vec<Bytes>;
+}
+
 /// Produces a range of a slab's shards from its data shards.
 ///
 /// The real implementation is the erasure coder; tests use a fake so the

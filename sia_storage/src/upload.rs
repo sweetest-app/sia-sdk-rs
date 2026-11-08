@@ -256,6 +256,12 @@ fn encode_batch(
     Ok(out)
 }
 
+impl slab::ShardSource for OpenSlab {
+    fn data_shards(&self) -> Vec<Bytes> {
+        self.plain.iter().flatten().cloned().collect()
+    }
+}
+
 impl slab::Placement for worker::WorkerState {
     fn enqueue(&self, slab: SlabId, index: usize, data: Bytes) -> bool {
         self.add_shard(slab, index, data)
@@ -475,21 +481,26 @@ impl Upload {
         let ready = open.plain.iter().all(Option::is_some);
         if ready && !open.started {
             open.started = true;
-            let plain: Vec<Bytes> = open.plain.iter().flatten().cloned().collect();
-            self.spawn_encoder(id, key, plain);
+            // The plaintext moves into the encoder task, which frees it once the
+            // last batch is produced.
+            if let Some(open) = self.open.remove(&id) {
+                self.spawn_encoder(id, open);
+            }
         }
         Ok(())
     }
 
     /// Produces the slab's parity shards in batches, two slabs at a time.
-    fn spawn_encoder(&self, id: SlabId, key: EncryptionKey, plain: Vec<Bytes>) {
+    fn spawn_encoder(&self, id: SlabId, open: OpenSlab) {
         let state = self.state.clone();
         let coder = self.erasure_coder.clone();
         let slots = self.encoders.clone();
+        let key = open.key.clone();
         let data_shards = self.erasure_coder.data_shards();
         let total = self.total_shards;
+        let size = open.plain[0].as_ref().map(|shard| shard.len()).unwrap_or(0);
         maybe_spawn!(async move {
-            let encoded: Result<(), UploadError> = async {
+            let encoded: Result<(), UploadError> = async move {
                 let _permit = slots.acquire().await;
                 let started = Instant::now();
                 for first in (data_shards..total).step_by(PARITY_BATCH) {
@@ -499,11 +510,10 @@ impl Upload {
                         break;
                     }
                     let count = PARITY_BATCH.min(total - first);
-                    let size = plain[0].len();
                     let batch_coder = coder.clone();
-                    let batch_plain = plain.clone();
+                    let inputs = slab::ShardSource::data_shards(&open);
                     let mut out = maybe_spawn_blocking!({
-                        encode_batch(&batch_coder, &batch_plain, first, count, size)
+                        encode_batch(&batch_coder, &inputs, first, count, size)
                     })?;
                     for (offset, shard) in out.iter_mut().enumerate() {
                         encrypt_shard(&key, (first + offset) as u8, 0, shard);
