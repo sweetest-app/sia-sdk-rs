@@ -39,15 +39,10 @@ const PARITY_BATCH: usize = 5;
 const INITIAL_INFLIGHT: usize = 8;
 const MIN_INFLIGHT: usize = 2;
 
-#[cfg(not(target_arch = "wasm32"))]
-fn default_slabs_in_memory(slab_size: usize) -> usize {
-    (crate::default_memory_budget() / slab_size as u64).max(1) as usize
-}
-
-#[cfg(target_arch = "wasm32")]
-fn default_slabs_in_memory(_slab_size: usize) -> usize {
-    3
-}
+/// The ceiling the inflight controller may raise to, in shards. It is not a
+/// window: a slab is only held while a batch of its shards is being produced, so
+/// this bounds write concurrency rather than memory.
+const MAX_INFLIGHT: usize = 90;
 
 /// Gates concurrent shard uploads at the [`InflightController`]'s current
 /// limit. Replaces a fixed semaphore so the limit can adapt while uploads are
@@ -257,6 +252,12 @@ fn encode_batch(
     Ok(out)
 }
 
+impl slab::Placement for worker::WorkerState {
+    fn enqueue(&self, slab: SlabId, index: usize, data: Bytes) -> bool {
+        self.add_shard(slab, index, data)
+    }
+}
+
 impl slab::Encoder for ErasureCoder {
     fn encode_range(
         &self,
@@ -350,20 +351,16 @@ impl Upload {
                     UploadError::InvalidOptions(format!("failed to create erasure coder: {e}"))
                 })?;
 
-        let max_buffered_slabs = options
-            .max_buffered_slabs
-            .unwrap_or_else(|| default_slabs_in_memory(options.slab_size()));
         let limiter = Arc::new(UploadLimiter::new(
             INITIAL_INFLIGHT,
             MIN_INFLIGHT,
-            max_buffered_slabs.saturating_mul(total_shards),
+            MAX_INFLIGHT,
         ));
         let state = Arc::new(worker::WorkerState::new(
             client.clone(),
             api_client.clone(),
             app_key.clone(),
             limiter,
-            max_buffered_slabs,
             options.shard_uploaded.clone(),
             options.shard_attempt.clone(),
         ));
@@ -454,7 +451,7 @@ impl Upload {
         // for the rest of the slab is still being produced.
         let mut shard = plain.to_vec();
         encrypt_shard(&key, index as u8, 0, &mut shard);
-        self.state.add_shard(id, index, Bytes::from(shard));
+        slab::Placement::enqueue(&*self.state, id, index, Bytes::from(shard));
         worker::ensure_workers(&self.state);
         self.state.notify_work();
 
@@ -479,6 +476,11 @@ impl Upload {
                 let _permit = slots.acquire().await;
                 let started = Instant::now();
                 for first in (data_shards..total).step_by(PARITY_BATCH) {
+                    // Cancelled while encoding: stop before the next batch rather
+                    // than finish work whose shards nobody will write.
+                    if state.is_closed() {
+                        break;
+                    }
                     let count = PARITY_BATCH.min(total - first);
                     let size = plain[0].len();
                     let batch_coder = coder.clone();
@@ -490,7 +492,7 @@ impl Upload {
                         encrypt_shard(&key, (first + offset) as u8, 0, shard);
                     }
                     for (offset, shard) in out.into_iter().enumerate() {
-                        state.add_shard(id, first + offset, Bytes::from(shard));
+                        slab::Placement::enqueue(&*state, id, first + offset, Bytes::from(shard));
                     }
                     state.notify_work();
                 }
@@ -628,6 +630,15 @@ struct ObjectUpload {
     start: u64,
     end: u64,
     object: Object,
+}
+
+/// Dropping an upload is a cancel: the workers stop, the dials are aborted, and
+/// an encoder stops at its next batch instead of finishing shards nobody will
+/// write.
+impl Drop for Upload {
+    fn drop(&mut self) {
+        self.state.shutdown();
+    }
 }
 
 /// A packed upload allows multiple objects to be uploaded together in a single upload. This can be more
@@ -1214,6 +1225,30 @@ mod tests {
                 .unwrap();
             assert_eq!(recovered, expected);
         }
+    }
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_dropping_an_upload_cancels_it() {
+        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
+        hosts.update(
+            (0..30)
+                .map(|_| test_host(PrivateKey::from_seed(&rand::random()).public_key()))
+                .collect(),
+            true,
+        );
+        let mut packed = PackedUpload::new(
+            hosts,
+            app_client::Client::mock(),
+            Arc::new(AppKey::import(rand::random())),
+            PackedUploadOptions::default(),
+        )
+        .unwrap();
+        packed.add(Cursor::new(vec![1u8; 111])).await.unwrap();
+
+        let state = packed.upload.state.clone();
+        assert!(!state.is_closed(), "an upload in flight is open");
+        drop(packed);
+        assert!(state.is_closed(), "dropping the upload cancels it");
     }
 
     #[sia_core_derive::cross_target_test]

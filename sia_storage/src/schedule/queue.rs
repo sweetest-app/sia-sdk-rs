@@ -148,6 +148,16 @@ impl RequestQueue {
         self.pending.len()
     }
 
+    /// Abandons every slab and drops the work still queued for it. Called when
+    /// the upload is cancelled, so nothing is written for a slab nobody wants.
+    pub(crate) fn cancel_all(&mut self) {
+        self.pending.clear();
+        for tracker in self.slabs.values_mut() {
+            tracker.cancel();
+        }
+        self.slabs.clear();
+    }
+
     #[cfg(test)]
     pub(crate) fn open_slabs(&self) -> usize {
         self.slabs.len()
@@ -335,6 +345,35 @@ mod tests {
             Some(slab),
             "the slab completes when the last shard lands",
         );
+    }
+
+    #[test]
+    fn every_slab_with_a_shard_is_open_at_once() {
+        // Five slabs of thirty is more than the old buffered window allowed, and
+        // each one must hand out work without waiting for the others.
+        let mut queue = RequestQueue::new();
+        let ids: Vec<SlabId> = (0..5).map(|_| add(&mut queue, 30)).collect();
+        assert_eq!(queue.open_slabs(), 5);
+
+        for seed in 1..=5u8 {
+            let host = key(seed);
+            let request = queue.take(&host).expect("work from one of the slabs");
+            assert!(ids.contains(&request.slab));
+            place(&mut queue, host, &request);
+        }
+    }
+
+    #[test]
+    fn cancelling_drops_queued_work_and_abandons_slabs() {
+        let mut queue = RequestQueue::new();
+        add(&mut queue, 30);
+        add(&mut queue, 30);
+        assert!(queue.pending() > 0);
+
+        queue.cancel_all();
+        assert_eq!(queue.pending(), 0, "no shard is left to write");
+        assert_eq!(queue.open_slabs(), 0, "no slab is left open");
+        assert!(queue.take(&key(1)).is_none(), "nothing to hand out");
     }
 
     #[test]

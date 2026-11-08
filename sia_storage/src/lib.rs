@@ -435,14 +435,6 @@ pub struct UploadOptions {
     pub data_shards: u8,
     /// The number of parity shards per slab. Defaults to 20.
     pub parity_shards: u8,
-    /// The maximum number of slabs to actively hold in memory. Higher
-    /// values may increase throughput due to parallelism at the cost
-    /// of more memory usage.
-    ///
-    /// At least one fully-encoded slab must be in memory. Defaults to
-    /// 10% of system memory or 1GB, whichever is lower.
-    pub max_buffered_slabs: Option<usize>,
-
     /// Optional callback to receive progress updates for each uploaded shard.
     /// A shard may be reported more than once if its slab outlives the hosts'
     /// temporary storage and is uploaded again.
@@ -503,12 +495,6 @@ impl UploadOptions {
         const MIN_RECOVERY_PROBABILITY: f64 = 99.99;
         const MAX_TOTAL_SHARDS: u16 = 256;
 
-        if self.max_buffered_slabs == Some(0) {
-            return Err(UploadError::InvalidOptions(
-                "max buffered slabs must be greater than 0".into(),
-            ));
-        }
-
         let data_shards = self.data_shards as u16;
         let parity_shards = self.parity_shards as u16;
         let total_shards = data_shards + parity_shards;
@@ -566,7 +552,6 @@ impl Default for UploadOptions {
         Self {
             data_shards: 10,
             parity_shards: 20,
-            max_buffered_slabs: None,
             shard_uploaded: None,
             shard_attempt: None,
             start_offset: None,
@@ -581,14 +566,6 @@ pub struct PackedUploadOptions {
     pub data_shards: u8,
     /// The number of parity shards per slab. Defaults to 20.
     pub parity_shards: u8,
-    /// The maximum number of slabs to actively hold in memory. Higher
-    /// values may increase throughput due to parallelism at the cost
-    /// of more memory usage.
-    ///
-    /// At least one fully-encoded slab must be in memory. Defaults to
-    /// 10% of system memory.
-    pub max_buffered_slabs: Option<usize>,
-
     /// Optional callback to receive progress updates for each uploaded shard.
     /// A shard may be reported more than once if its slab outlives the hosts'
     /// temporary storage and is uploaded again.
@@ -603,7 +580,6 @@ impl Default for PackedUploadOptions {
         Self {
             data_shards: 10,
             parity_shards: 20,
-            max_buffered_slabs: None,
             shard_uploaded: None,
             shard_attempt: None,
         }
@@ -627,7 +603,6 @@ impl From<PackedUploadOptions> for UploadOptions {
         Self {
             data_shards: options.data_shards,
             parity_shards: options.parity_shards,
-            max_buffered_slabs: options.max_buffered_slabs,
             shard_uploaded: options.shard_uploaded,
             shard_attempt: options.shard_attempt,
             start_offset: None,

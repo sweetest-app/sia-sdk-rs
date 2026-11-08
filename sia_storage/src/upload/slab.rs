@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 
-use crate::schedule::{SlabId, SlabSeed};
+use crate::schedule::SlabId;
 
 /// Where a slab is in its life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +43,6 @@ pub(crate) enum SlabError {
 #[derive(Debug)]
 pub(crate) struct Slab {
     id: SlabId,
-    seed: SlabSeed,
     state: SlabState,
     /// The data shards, filled as they arrive. These are the source the encoder
     /// reads from.
@@ -56,10 +55,9 @@ pub(crate) struct Slab {
 impl Slab {
     /// A slab waiting for its data shards. `data_shards` of them, `total`
     /// shards once parity is included.
-    pub(crate) fn open(id: SlabId, seed: SlabSeed, data_shards: usize, total: usize) -> Self {
+    pub(crate) fn open(id: SlabId, data_shards: usize, total: usize) -> Self {
         Self {
             id,
-            seed,
             state: SlabState::Open,
             data: vec![None; data_shards],
             placed: vec![false; total],
@@ -69,10 +67,6 @@ impl Slab {
 
     pub(crate) fn id(&self) -> SlabId {
         self.id
-    }
-
-    pub(crate) fn seed(&self) -> &SlabSeed {
-        &self.seed
     }
 
     pub(crate) fn state(&self) -> SlabState {
@@ -85,10 +79,6 @@ impl Slab {
 
     pub(crate) fn placed_count(&self) -> usize {
         self.placed_count
-    }
-
-    pub(crate) fn is_placed(&self, index: usize) -> bool {
-        self.placed.get(index).copied().unwrap_or(false)
     }
 
     /// Takes one data shard. Only while the slab is open, and only once per
@@ -132,11 +122,6 @@ impl Slab {
         }
         self.state = SlabState::Frozen;
         Ok(())
-    }
-
-    /// The data shards the encoder reads, in order.
-    pub(crate) fn data_shards(&self) -> Vec<&[u8]> {
-        self.data.iter().filter_map(|s| s.as_deref()).collect()
     }
 
     /// Placing begins once at least one shard has been queued.
@@ -246,20 +231,12 @@ pub(crate) trait Placement {
 mod tests {
     use super::*;
 
-    fn seed() -> SlabSeed {
-        SlabSeed {
-            encryption_key: [1u8; 32].into(),
-            length: 4096,
-            min_shards: 10,
-        }
-    }
-
     fn byte(value: u8) -> Bytes {
         Bytes::from(vec![value; 8])
     }
 
     fn open() -> Slab {
-        Slab::open(SlabId(1), seed(), 10, 30)
+        Slab::open(SlabId(1), 10, 30)
     }
 
     fn with_data() -> Slab {
@@ -302,16 +279,6 @@ mod tests {
                 actual: SlabState::Frozen,
             })
         );
-    }
-
-    #[test]
-    fn data_shards_come_out_in_order_for_the_encoder() {
-        let slab = with_data();
-        let data = slab.data_shards();
-        assert_eq!(data.len(), 10);
-        for (index, shard) in data.iter().enumerate() {
-            assert_eq!(shard[0], index as u8);
-        }
     }
 
     #[test]

@@ -63,9 +63,6 @@ pub(crate) struct WorkerState {
     /// Slabs handed to the schedule, and slabs pinned.
     registered: AtomicUsize,
     finished: AtomicUsize,
-    /// Slabs holding shard memory right now, bounded by `max_buffered`.
-    buffered: AtomicUsize,
-    max_buffered: usize,
     closed: AtomicBool,
     /// Set when a slab could not be pinned and no retry can help.
     stalled: AtomicBool,
@@ -80,7 +77,6 @@ pub(crate) struct WorkerState {
     /// A slab was pinned, or the upload stalled.
     done: tokio::sync::Notify,
     /// A slab's memory was released.
-    slot: tokio::sync::Notify,
     progress: Option<ShardProgressCallback>,
     attempt: Option<ShardAttemptCallback>,
 }
@@ -92,7 +88,6 @@ impl WorkerState {
         api_client: app_client::Client,
         app_key: Arc<AppKey>,
         limiter: Arc<UploadLimiter>,
-        max_buffered: usize,
         progress: Option<ShardProgressCallback>,
         attempt: Option<ShardAttemptCallback>,
     ) -> Self {
@@ -114,8 +109,6 @@ impl WorkerState {
             pinned: Mutex::new(Vec::new()),
             registered: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
-            buffered: AtomicUsize::new(0),
-            max_buffered,
             closed: AtomicBool::new(false),
             stalled: AtomicBool::new(false),
             failure: Mutex::new(None),
@@ -123,7 +116,6 @@ impl WorkerState {
             workers: Mutex::new(Vec::new()),
             work: tokio::sync::Notify::new(),
             done: tokio::sync::Notify::new(),
-            slot: tokio::sync::Notify::new(),
             progress,
             attempt,
         }
@@ -152,19 +144,6 @@ impl WorkerState {
             }
         }
         self.registered.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub(crate) fn slack_available(&self) -> bool {
-        self.buffered.load(Ordering::SeqCst) < self.max_buffered
-    }
-
-    pub(crate) fn take_slot(&self) {
-        self.buffered.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub(crate) fn release_slot(&self) {
-        self.buffered.fetch_sub(1, Ordering::SeqCst);
-        self.slot.notify_waiters();
     }
 
     pub(crate) fn notify_work(&self) {
@@ -204,10 +183,6 @@ impl WorkerState {
         self.done.notified()
     }
 
-    pub(crate) fn slot_notify(&self) -> tokio::sync::futures::Notified<'_> {
-        self.slot.notified()
-    }
-
     /// Stops every worker and returns the pinned slabs in order.
     /// The slabs pinned so far, indexed by slab id. `None` is a slab that is
     /// still filling or uploading, so a caller can tell what is finished
@@ -216,9 +191,17 @@ impl WorkerState {
         self.pinned.lock().unwrap().clone()
     }
 
+    /// Whether the upload has been stopped.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn shutdown(&self) -> Vec<Slab> {
         self.closed.store(true, Ordering::SeqCst);
         self.work.notify_waiters();
+        // Nothing is written for a slab nobody wants any more: the queue drops
+        // its pending shards and every slab that is not pinned is abandoned.
+        self.queue.lock().unwrap().cancel_all();
         // Dropping an AbortOnDropHandle aborts the task behind it. A dial that is
         // still running here never reports back, so its mark has to be released
         // by hand or the pool believes it has a dial it does not have.
@@ -468,7 +451,6 @@ async fn pin(state: &Arc<WorkerState>, finished: FinishedSlab) {
                     pinned[index] = Some(slab);
                 }
             }
-            state.release_slot();
             let done = state.finished.fetch_add(1, Ordering::SeqCst) + 1;
             debug!(
                 "[upload] slab {} pinned ({done} of {})",

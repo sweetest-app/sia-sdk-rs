@@ -37,6 +37,7 @@ impl ErasureCoder {
 
     /// encodes the shards using reed solomon erasure coding,
     /// computing the parity shards and overwriting their values.
+    #[cfg(test)]
     pub fn encode_shards(&self, shards: &mut [Vec<u8>]) -> Result<()> {
         self.encoder.encode(shards)?;
         Ok(())

@@ -142,7 +142,6 @@ const _: &str = r#"
 export interface UploadOptions {
     dataShards?: number;
     parityShards?: number;
-    maxBufferedSlabs?: number;
     startOffset?: bigint;
     onShardUploaded?: (progress: ShardProgress) => void;
     onShardAttempted?: (attempt: ShardAttemptInfo) => void;
@@ -151,7 +150,6 @@ export interface UploadOptions {
 export interface PackedUploadOptions {
     dataShards?: number;
     parityShards?: number;
-    maxBufferedSlabs?: number;
     onShardUploaded?: (progress: ShardProgress) => void;
     onShardAttempted?: (attempt: ShardAttemptInfo) => void;
 }
@@ -211,9 +209,6 @@ fn packed_options_from_obj(obj: &js_sys::Object) -> sia_storage::PackedUploadOpt
     }
     if let Some(v) = get_f64(obj, "parityShards") {
         options.parity_shards = v as u8;
-    }
-    if let Some(v) = get_f64(obj, "maxBufferedSlabs") {
-        options.max_buffered_slabs = Some(v as usize);
     }
     if let Some(cb) = get_function(obj, "onShardUploaded") {
         options.shard_uploaded = Some(shard_progress_callback(cb));

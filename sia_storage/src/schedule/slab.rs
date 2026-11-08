@@ -80,7 +80,7 @@ impl SlabTracker {
     pub(crate) fn open(id: SlabId, order: u64, seed: SlabSeed, total: usize) -> Self {
         let data_shards = seed.min_shards as usize;
         Self {
-            slab: Slab::open(id, seed.clone(), data_shards, total),
+            slab: Slab::open(id, data_shards, total),
             seed,
             shards: vec![None; total],
             sectors: vec![None; total],
@@ -93,6 +93,7 @@ impl SlabTracker {
         self.order
     }
 
+    #[cfg(test)]
     pub(crate) fn state(&self) -> SlabState {
         self.slab.state()
     }
@@ -108,6 +109,12 @@ impl SlabTracker {
 
     pub(crate) fn is_complete(&self) -> bool {
         self.slab.all_placed()
+    }
+
+    /// Abandons the slab whatever state it is in. A pinned slab refuses,
+    /// because its shards are already paid for.
+    pub(crate) fn cancel(&mut self) -> bool {
+        self.slab.cancel().is_ok()
     }
 
     pub(crate) fn has_served(&self, host: &PublicKey) -> bool {
