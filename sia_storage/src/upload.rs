@@ -24,7 +24,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::oneshot;
 
-mod slab;
+pub(crate) mod slab;
 mod worker;
 
 const INITIAL_INFLIGHT: usize = 8;

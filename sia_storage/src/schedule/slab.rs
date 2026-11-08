@@ -6,6 +6,7 @@ use sia_core::signing::PublicKey;
 use crate::app_client::{SectorPinParams, SlabPinParams};
 use crate::encryption::EncryptionKey;
 use crate::slabs::SlabVersion;
+use crate::upload::slab::{Slab, SlabState};
 
 /// Identifies one slab inside one upload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -33,6 +34,9 @@ pub(crate) struct FinishedSlab {
     pub seed: SlabSeed,
     pub shards: Vec<Bytes>,
     pub pin: SlabPinParams,
+    /// The lifecycle that produced it, so the pin result is recorded on the same
+    /// slab rather than on a copy of its counters.
+    pub slab: Slab,
 }
 
 /// What the schedule knows about a slab while its shards are being placed.
@@ -42,12 +46,13 @@ pub(crate) struct FinishedSlab {
 /// shards of a half finished slab are work that cannot be kept.
 #[derive(Debug)]
 pub(crate) struct SlabTracker {
-    id: SlabId,
-    total: usize,
+    /// The lifecycle: open, frozen, placing, pinned or abandoned, and which
+    /// shards have landed.
+    slab: Slab,
     seed: SlabSeed,
-    /// The shards that have arrived, kept until the slab is pinned so a stale
-    /// retry can send the same bytes again. `None` until the shard is produced:
-    /// data shards arrive from the caller, parity from the encoder.
+    /// The shards that have been produced, kept until the slab is pinned so a
+    /// stale retry can send the same bytes again. `None` until produced: data
+    /// shards arrive from the caller, parity from the encoder.
     shards: Vec<Option<Bytes>>,
     /// One entry per shard, filled as the shards land. A slot, not a counter,
     /// so a shard reported twice cannot make a slab look complete.
@@ -60,29 +65,22 @@ pub(crate) struct SlabTracker {
 }
 
 impl SlabTracker {
-    pub(crate) fn new(
-        id: SlabId,
-        order: u64,
-        seed: SlabSeed,
-        shards: Vec<Bytes>,
-    ) -> Self {
+    /// A slab whose shards are all known already, used when a slab is put back
+    /// for another attempt.
+    pub(crate) fn new(id: SlabId, order: u64, seed: SlabSeed, shards: Vec<Bytes>) -> Self {
         let total = shards.len();
-        Self {
-            id,
-            total,
-            seed,
-            shards: shards.into_iter().map(Some).collect(),
-            sectors: vec![None; total],
-            served: HashSet::new(),
-            order,
+        let mut tracker = Self::open(id, order, seed, total);
+        for (index, shard) in shards.into_iter().enumerate() {
+            tracker.push(index, shard);
         }
+        tracker
     }
 
     /// Opens a slab whose shards are produced one at a time.
     pub(crate) fn open(id: SlabId, order: u64, seed: SlabSeed, total: usize) -> Self {
+        let data_shards = seed.min_shards as usize;
         Self {
-            id,
-            total,
+            slab: Slab::open(id, seed.clone(), data_shards, total),
             seed,
             shards: vec![None; total],
             sectors: vec![None; total],
@@ -91,41 +89,49 @@ impl SlabTracker {
         }
     }
 
-    /// Records one produced shard. Returns false when the index is outside the
-    /// slab or the shard is already there, so a duplicate cannot make the slab
-    /// look complete.
-    pub(crate) fn push(&mut self, index: usize, data: Bytes) -> bool {
-        if index >= self.total || self.shards[index].is_some() {
-            return false;
-        }
-        self.shards[index] = Some(data);
-        true
-    }
-
-    /// Whether every shard has been produced, which is when encoding is done.
-    pub(crate) fn all_produced(&self) -> bool {
-        self.shards.iter().all(Option::is_some)
-    }
-
     pub(crate) fn order(&self) -> u64 {
         self.order
     }
 
+    pub(crate) fn state(&self) -> SlabState {
+        self.slab.state()
+    }
+
     pub(crate) fn remaining(&self) -> usize {
-        self.sectors.iter().filter(|slot| slot.is_none()).count()
+        self.slab.total() - self.slab.placed_count()
     }
 
     #[cfg(test)]
     pub(crate) fn placed(&self) -> usize {
-        self.sectors.iter().filter(|slot| slot.is_some()).count()
+        self.slab.placed_count()
     }
 
     pub(crate) fn is_complete(&self) -> bool {
-        self.remaining() == 0
+        self.slab.all_placed()
     }
 
     pub(crate) fn has_served(&self, host: &PublicKey) -> bool {
         self.served.contains(host)
+    }
+
+    /// Records one produced shard. Returns false when the index is outside the
+    /// slab, the shard is already there, or the slab no longer takes data.
+    pub(crate) fn push(&mut self, index: usize, data: Bytes) -> bool {
+        if index >= self.shards.len() || self.shards[index].is_some() {
+            return false;
+        }
+        if index < self.seed.min_shards as usize {
+            if self.slab.add_data_shard(index, data.clone()).is_err() {
+                return false;
+            }
+            if self.slab.all_data() && self.slab.state() == SlabState::Open {
+                // Every data shard is in, so the slab's bytes are fixed and the
+                // encoder may read them.
+                let _ = self.slab.freeze();
+            }
+        }
+        self.shards[index] = Some(data);
+        true
     }
 
     /// Records a placed shard. Returns false when the shard was already
@@ -136,7 +142,13 @@ impl SlabTracker {
         host: PublicKey,
         sector: SectorPinParams,
     ) -> bool {
-        if shard >= self.total || self.sectors[shard].is_some() {
+        if shard >= self.sectors.len() || self.sectors[shard].is_some() {
+            return false;
+        }
+        if self.slab.state() == SlabState::Frozen {
+            let _ = self.slab.begin_placing();
+        }
+        if self.slab.shard_placed(shard).is_err() {
             return false;
         }
         self.sectors[shard] = Some(sector);
@@ -146,10 +158,13 @@ impl SlabTracker {
 
     /// The pin request for a complete slab, or None when a shard is missing.
     pub(crate) fn finish(self) -> Option<FinishedSlab> {
+        if !self.slab.all_placed() {
+            return None;
+        }
         let sectors: Option<Vec<SectorPinParams>> = self.sectors.into_iter().collect();
         let shards: Option<Vec<Bytes>> = self.shards.into_iter().collect();
         Some(FinishedSlab {
-            id: self.id,
+            id: self.slab.id(),
             order: self.order,
             seed: self.seed.clone(),
             shards: shards?,
@@ -159,6 +174,7 @@ impl SlabTracker {
                 min_shards: self.seed.min_shards,
                 sectors: sectors?,
             },
+            slab: self.slab,
         })
     }
 }
@@ -193,13 +209,24 @@ mod tests {
         }
     }
 
-    fn shards(count: usize) -> Vec<Bytes> {
-        (0..count).map(|index| Bytes::from(vec![index as u8; 8])).collect()
+    /// A slab with every shard already produced, so placement can be tested on
+    /// its own.
+    fn produced(count: usize) -> SlabTracker {
+        let id = SlabId(1);
+        // Every shard is a data shard here, so the slab freezes as soon as they
+        // are all in and the test can go straight to placement.
+        let mut header = seed();
+        header.min_shards = count as u8;
+        let mut tracker = SlabTracker::open(id, 0, header, count);
+        for index in 0..count {
+            assert!(tracker.push(index, Bytes::from(vec![index as u8; 8])));
+        }
+        tracker
     }
 
     #[test]
     fn a_slab_is_complete_only_when_every_shard_has_landed() {
-        let mut slab = SlabTracker::new(SlabId(1), 0, seed(), shards(3));
+        let mut slab = produced(3);
         assert!(slab.record(0, key(1), sector(key(1))));
         assert_eq!(slab.remaining(), 2);
         assert!(!slab.is_complete());
@@ -212,22 +239,56 @@ mod tests {
 
     #[test]
     fn a_shard_reported_twice_does_not_advance_the_slab() {
-        let mut slab = SlabTracker::new(SlabId(1), 0, seed(), shards(2));
+        let mut slab = produced(2);
         assert!(slab.record(0, key(1), sector(key(1))));
-        assert!(!slab.record(0, key(2), sector(key(2))), "a duplicate is not progress");
+        assert!(
+            !slab.record(0, key(2), sector(key(2))),
+            "a duplicate is not progress"
+        );
         assert_eq!(slab.placed(), 1);
     }
 
     #[test]
     fn a_shard_index_outside_the_slab_is_refused() {
-        let mut slab = SlabTracker::new(SlabId(1), 0, seed(), shards(2));
+        let mut slab = produced(2);
         assert!(!slab.record(2, key(1), sector(key(1))));
         assert_eq!(slab.placed(), 0);
     }
 
     #[test]
+    fn a_produced_shard_twice_is_refused() {
+        let mut slab = SlabTracker::open(SlabId(1), 0, seed(), 30);
+        assert!(slab.push(0, Bytes::from_static(b"one")));
+        assert!(!slab.push(0, Bytes::from_static(b"two")), "duplicate");
+        assert!(!slab.push(30, Bytes::from_static(b"far")), "out of range");
+    }
+
+    #[test]
+    fn a_slab_freezes_once_its_data_shards_are_in() {
+        let mut slab = SlabTracker::open(SlabId(1), 0, seed(), 30);
+        for index in 0..9 {
+            assert!(slab.push(index, Bytes::from(vec![index as u8; 8])));
+            assert_eq!(slab.state(), SlabState::Open, "nine of ten is not data");
+        }
+        assert!(slab.push(9, Bytes::from(vec![9u8; 8])));
+        assert_eq!(slab.state(), SlabState::Frozen, "ten of ten freezes");
+        assert!(
+            !slab.push(3, Bytes::from(vec![3u8; 8])),
+            "a frozen slab takes no more data"
+        );
+    }
+
+    #[test]
+    fn placing_starts_at_the_first_placed_shard() {
+        let mut slab = produced(2);
+        assert_eq!(slab.state(), SlabState::Frozen);
+        slab.record(0, key(1), sector(key(1)));
+        assert_eq!(slab.state(), SlabState::Placing);
+    }
+
+    #[test]
     fn a_host_that_placed_a_shard_is_recorded_as_served() {
-        let mut slab = SlabTracker::new(SlabId(1), 0, seed(), shards(2));
+        let mut slab = produced(2);
         assert!(!slab.has_served(&key(1)));
         slab.record(0, key(1), sector(key(1)));
         assert!(slab.has_served(&key(1)));
@@ -236,15 +297,33 @@ mod tests {
 
     #[test]
     fn finishing_carries_every_sector_and_the_slab_header() {
-        let mut slab = SlabTracker::new(SlabId(9), 0, seed(), shards(2));
+        let mut slab = produced(2);
         slab.record(1, key(2), sector(key(2)));
         slab.record(0, key(1), sector(key(1)));
         let finished = slab.finish().expect("every shard is in");
-        assert_eq!(finished.id, SlabId(9));
+        assert_eq!(finished.id, SlabId(1));
         assert_eq!(finished.shards.len(), 2, "the shards come back for a retry");
-        assert_eq!(finished.pin.min_shards, 10);
+        assert_eq!(finished.pin.min_shards, 2, "every shard is data in this fixture");
         assert_eq!(finished.pin.sectors.len(), 2);
         assert_eq!(finished.pin.sectors[0].sector.host_key, key(1));
         assert_eq!(finished.pin.sectors[1].sector.host_key, key(2));
+        assert_eq!(finished.slab.state(), SlabState::Placing);
+    }
+
+    #[test]
+    fn a_slab_missing_a_shard_does_not_finish() {
+        let mut slab = produced(2);
+        slab.record(0, key(1), sector(key(1)));
+        assert!(slab.finish().is_none());
+    }
+
+    #[test]
+    fn the_pin_result_is_recorded_on_the_slab() {
+        let mut slab = produced(2);
+        slab.record(0, key(1), sector(key(1)));
+        slab.record(1, key(2), sector(key(2)));
+        let mut finished = slab.finish().expect("every shard is in");
+        finished.slab.pin_ok().expect("pin accepted");
+        assert_eq!(finished.slab.state(), SlabState::Pinned);
     }
 }

@@ -35,21 +35,6 @@ impl RequestQueue {
         Self::default()
     }
 
-    /// Registers a finished slab's shards and returns its id. Every shard starts
-    /// pending, in index order.
-    pub(crate) fn add_slab(&mut self, shards: Vec<Bytes>, seed: SlabSeed) -> SlabId {
-        self.next_slab += 1;
-        let id = SlabId(self.next_slab);
-        let order = self.next_order;
-        self.next_order += 1;
-        self.slabs
-            .insert(id, SlabTracker::new(id, order, seed, shards.clone()));
-        for (shard, data) in shards.into_iter().enumerate() {
-            self.pending.push(ShardRequest { slab: id, shard, data });
-        }
-        id
-    }
-
     /// Opens a slab whose shards will arrive one at a time, and returns its id.
     /// Nothing is queued until [`add_shard`](Self::add_shard).
     pub(crate) fn open_slab(&mut self, seed: SlabSeed, total: usize) -> SlabId {
@@ -205,7 +190,11 @@ mod tests {
 
     /// Opens a slab of `count` shards with the default header, and adds them.
     fn add(queue: &mut RequestQueue, count: usize) -> SlabId {
-        let id = queue.open_slab(seed(), count);
+        // Every shard is a data shard in these fixtures, so the slab freezes as
+        // soon as they are all in and placement can be tested on its own.
+        let mut header = seed();
+        header.min_shards = count as u8;
+        let id = queue.open_slab(header, count);
         for (index, shard) in shards(count).into_iter().enumerate() {
             assert!(queue.add_shard(id, index, shard));
         }

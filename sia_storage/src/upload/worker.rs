@@ -129,13 +129,6 @@ impl WorkerState {
         }
     }
 
-    /// Registers a slab and returns its place in the upload.
-    pub(crate) fn register(&self, shards: Vec<bytes::Bytes>, seed: SlabSeed) -> u64 {
-        let id = self.queue.lock().unwrap().add_slab(shards, seed);
-        self.bookkeep(id);
-        id.0
-    }
-
     /// Opens a slab whose shards will arrive one at a time, and returns its id.
     pub(crate) fn open_slab(&self, seed: SlabSeed, total: usize) -> SlabId {
         let id = self.queue.lock().unwrap().open_slab(seed, total);
@@ -457,10 +450,14 @@ async fn park(state: &Arc<WorkerState>) {
 }
 
 async fn pin(state: &Arc<WorkerState>, finished: FinishedSlab) {
+    let mut finished = finished;
     let index = (finished.id.0 as usize).saturating_sub(1);
     let length = finished.seed.length;
     match pin_uploaded_slab(&state.api_client, &state.app_key, finished.pin.clone()).await {
         Ok(()) => {
+            // The pin is the last event of the slab's life, so it is recorded on
+            // the same machine that saw every shard land.
+            let _ = finished.slab.pin_ok();
             let slab = Slab {
                 length,
                 ..Slab::from(&finished.pin)
@@ -509,6 +506,9 @@ async fn pin(state: &Arc<WorkerState>, finished: FinishedSlab) {
             state.work.notify_waiters();
         }
         Err(error) => {
+            // A pin that fails for good abandons the slab: its shards are spent
+            // and nothing can be retried from here.
+            let _ = finished.slab.pin_failed();
             debug!("[upload] slab {} could not be pinned: {error}", finished.id.0);
             state.stall(error);
         }
