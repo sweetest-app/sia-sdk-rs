@@ -45,9 +45,10 @@ pub(crate) struct SlabTracker {
     id: SlabId,
     total: usize,
     seed: SlabSeed,
-    /// The encoded sectors, kept until the slab is pinned so a stale retry can
-    /// send the same bytes again.
-    shards: Vec<Bytes>,
+    /// The shards that have arrived, kept until the slab is pinned so a stale
+    /// retry can send the same bytes again. `None` until the shard is produced:
+    /// data shards arrive from the caller, parity from the encoder.
+    shards: Vec<Option<Bytes>>,
     /// One entry per shard, filled as the shards land. A slot, not a counter,
     /// so a shard reported twice cannot make a slab look complete.
     sectors: Vec<Option<SectorPinParams>>,
@@ -70,11 +71,40 @@ impl SlabTracker {
             id,
             total,
             seed,
-            shards,
+            shards: shards.into_iter().map(Some).collect(),
             sectors: vec![None; total],
             served: HashSet::new(),
             order,
         }
+    }
+
+    /// Opens a slab whose shards are produced one at a time.
+    pub(crate) fn open(id: SlabId, order: u64, seed: SlabSeed, total: usize) -> Self {
+        Self {
+            id,
+            total,
+            seed,
+            shards: vec![None; total],
+            sectors: vec![None; total],
+            served: HashSet::new(),
+            order,
+        }
+    }
+
+    /// Records one produced shard. Returns false when the index is outside the
+    /// slab or the shard is already there, so a duplicate cannot make the slab
+    /// look complete.
+    pub(crate) fn push(&mut self, index: usize, data: Bytes) -> bool {
+        if index >= self.total || self.shards[index].is_some() {
+            return false;
+        }
+        self.shards[index] = Some(data);
+        true
+    }
+
+    /// Whether every shard has been produced, which is when encoding is done.
+    pub(crate) fn all_produced(&self) -> bool {
+        self.shards.iter().all(Option::is_some)
     }
 
     pub(crate) fn order(&self) -> u64 {
@@ -117,11 +147,12 @@ impl SlabTracker {
     /// The pin request for a complete slab, or None when a shard is missing.
     pub(crate) fn finish(self) -> Option<FinishedSlab> {
         let sectors: Option<Vec<SectorPinParams>> = self.sectors.into_iter().collect();
+        let shards: Option<Vec<Bytes>> = self.shards.into_iter().collect();
         Some(FinishedSlab {
             id: self.id,
             order: self.order,
             seed: self.seed.clone(),
-            shards: self.shards,
+            shards: shards?,
             pin: SlabPinParams {
                 version: SlabVersion::V1,
                 encryption_key: self.seed.encryption_key,

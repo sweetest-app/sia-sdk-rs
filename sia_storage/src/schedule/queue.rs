@@ -50,6 +50,35 @@ impl RequestQueue {
         id
     }
 
+    /// Opens a slab whose shards will arrive one at a time, and returns its id.
+    /// Nothing is queued until [`add_shard`](Self::add_shard).
+    pub(crate) fn open_slab(&mut self, seed: SlabSeed, total: usize) -> SlabId {
+        self.next_slab += 1;
+        let id = SlabId(self.next_slab);
+        let order = self.next_order;
+        self.next_order += 1;
+        self.slabs.insert(id, SlabTracker::open(id, order, seed, total));
+        id
+    }
+
+    /// Queues one produced shard for a slab opened with
+    /// [`open_slab`](Self::open_slab). Returns false when the shard does not
+    /// belong to the slab or was already produced.
+    pub(crate) fn add_shard(&mut self, id: SlabId, index: usize, data: Bytes) -> bool {
+        let Some(slab) = self.slabs.get_mut(&id) else {
+            return false;
+        };
+        if !slab.push(index, data.clone()) {
+            return false;
+        }
+        self.pending.push(ShardRequest {
+            slab: id,
+            shard: index,
+            data,
+        });
+        true
+    }
+
     /// Puts a slab back for another upload attempt, keeping its id and order so
     /// the caller's bookkeeping does not move. Used when the indexer rejects a
     /// slab as stale: the same bytes go out again rather than being re-encoded.
@@ -174,9 +203,13 @@ mod tests {
         }
     }
 
-    /// Adds a slab of `count` shards with the default header.
+    /// Opens a slab of `count` shards with the default header, and adds them.
     fn add(queue: &mut RequestQueue, count: usize) -> SlabId {
-        queue.add_slab(shards(count), seed())
+        let id = queue.open_slab(seed(), count);
+        for (index, shard) in shards(count).into_iter().enumerate() {
+            assert!(queue.add_shard(id, index, shard));
+        }
+        id
     }
 
     /// Places a shard with the sector the host would have written.

@@ -17,7 +17,7 @@ use sia_core::signing::PublicKey;
 use crate::app_client::{self, SectorPinParams};
 use crate::hosts::{Hosts, RPCError, RPC_IDLE_TIMEOUT};
 use crate::pool::{BanReason, HostPool, HostStats, HostView, LeaveReason};
-use crate::schedule::{FinishedSlab, RequestQueue, SlabSeed};
+use crate::schedule::{FinishedSlab, RequestQueue, SlabId, SlabSeed};
 use crate::slabs::Slab;
 use crate::task::AbortOnDropHandle;
 use crate::time::{sleep, Duration, Instant};
@@ -132,6 +132,25 @@ impl WorkerState {
     /// Registers a slab and returns its place in the upload.
     pub(crate) fn register(&self, shards: Vec<bytes::Bytes>, seed: SlabSeed) -> u64 {
         let id = self.queue.lock().unwrap().add_slab(shards, seed);
+        self.bookkeep(id);
+        id.0
+    }
+
+    /// Opens a slab whose shards will arrive one at a time, and returns its id.
+    pub(crate) fn open_slab(&self, seed: SlabSeed, total: usize) -> SlabId {
+        let id = self.queue.lock().unwrap().open_slab(seed, total);
+        self.bookkeep(id);
+        id
+    }
+
+    /// Queues one produced shard for an open slab. Returns false when the shard
+    /// does not belong to the slab or was already produced.
+    pub(crate) fn add_shard(&self, id: SlabId, index: usize, data: bytes::Bytes) -> bool {
+        self.queue.lock().unwrap().add_shard(id, index, data)
+    }
+
+    /// Reserves the pinned-slab slot for a newly registered slab.
+    fn bookkeep(&self, id: SlabId) {
         {
             let mut pinned = self.pinned.lock().unwrap();
             let index = (id.0 as usize).saturating_sub(1);
@@ -140,7 +159,6 @@ impl WorkerState {
             }
         }
         self.registered.fetch_add(1, Ordering::SeqCst);
-        id.0
     }
 
     pub(crate) fn slack_available(&self) -> bool {

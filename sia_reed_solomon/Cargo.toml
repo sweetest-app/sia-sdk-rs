@@ -1,0 +1,45 @@
+[package]
+name = "sia_reed_solomon"
+autotests = false
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.90"
+authors = ["The Sia Foundation"]
+description = "Reed-Solomon erasure coding over GF(2^8), translated from Klaus Post's reedsolomon Go library"
+readme = "README.md"
+keywords = ["reed-solomon", "erasure-coding", "galois", "sia"]
+categories = ["algorithms", "encoding"]
+license = "MIT"
+repository = "https://github.com/SiaFoundation/reed_solomon_rs"
+
+[features]
+default = ["parallel", "simd"]
+parallel = ["dep:rayon"]
+simd = []
+
+[lib]
+name = "sia_reed_solomon"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+bench = false
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[dependencies]
+cfg-if = "1.0"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+blake2 = "0.10"
+getrandom = "0.4"
+hex-literal = "1"
+rand = "0.10.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { version = "1.11", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+wasm-bindgen-test = "0.3"

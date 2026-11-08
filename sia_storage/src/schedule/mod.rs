@@ -11,4 +11,4 @@ mod queue;
 mod slab;
 
 pub(crate) use queue::RequestQueue;
-pub(crate) use slab::{FinishedSlab, SlabSeed};
+pub(crate) use slab::{FinishedSlab, SlabId, SlabSeed};

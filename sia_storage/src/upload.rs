@@ -24,6 +24,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::oneshot;
 
+mod slab;
 mod worker;
 
 const INITIAL_INFLIGHT: usize = 8;
@@ -373,14 +374,17 @@ impl Upload {
             encrypted.push(data);
         }
 
-        self.state.register(
-            encrypted,
+        let id = self.state.open_slab(
             crate::schedule::SlabSeed {
                 encryption_key,
                 length,
                 min_shards,
             },
+            encrypted.len(),
         );
+        for (index, data) in encrypted.into_iter().enumerate() {
+            self.state.add_shard(id, index, data);
+        }
         worker::ensure_workers(&self.state);
         self.state.notify_work();
         Ok(())
