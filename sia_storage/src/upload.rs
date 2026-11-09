@@ -329,6 +329,10 @@ struct OpenSlab {
     /// Set once the encoder has been started, so the tenth shard cannot start it
     /// twice.
     started: bool,
+    /// The encoder slot this slab holds. It is taken when the slab is opened, not
+    /// when the encoder task runs, so a slab cannot sit with its plaintext while
+    /// its encoder waits for a slot. The underscore says it is held for its drop.
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Upload {
@@ -423,6 +427,12 @@ impl Upload {
             self.state.queued(),
             self.open.len(),
         );
+        // Hold the encoder slot from here. `wait_for_room` has already checked
+        // that one is free, so this does not wait, and taking it now means the
+        // reader cannot read a slab whose encoder has no slot.
+        let Some(permit) = self.encoders.clone().acquire_owned().await.ok() else {
+            return Ok(None);
+        };
         let key = encryption_key;
         let seed = crate::schedule::SlabSeed {
             encryption_key: key.clone(),
@@ -436,6 +446,7 @@ impl Upload {
                 key,
                 plain: vec![None; min_shards],
                 started: false,
+                _permit: Some(permit),
             },
         );
         Ok(Some(id))
@@ -511,14 +522,15 @@ impl Upload {
     fn spawn_encoder(&self, id: SlabId, open: OpenSlab) {
         let state = self.state.clone();
         let coder = self.erasure_coder.clone();
-        let slots = self.encoders.clone();
         let key = open.key.clone();
+        // The slot travels with `open`, which the task owns. Fields drop in
+        // declaration order, so the plaintext is released before the slot is,
+        // and a slab change cannot double the plaintext.
         let data_shards = self.erasure_coder.data_shards();
         let total = self.total_shards;
         let size = open.plain[0].as_ref().map(|shard| shard.len()).unwrap_or(0);
         maybe_spawn!(async move {
             let encoded: Result<(), UploadError> = async move {
-                let _permit = slots.acquire().await;
                 let started = Instant::now();
                 // The plaintext is the encoder's input for every batch; the
                 // batches only split its output.
@@ -542,17 +554,32 @@ impl Upload {
                     for (offset, shard) in out.iter_mut().enumerate() {
                         encrypt_shard(&key, (first + offset) as u8, 0, shard);
                     }
+                    // The batch is held until its shards are queued: it is real
+                    // memory at the cap, so the count includes it.
+                    let batch_bytes: usize = out.iter().map(Vec::len).sum();
+                    state.held_add(batch_bytes);
                     // Parity takes the same queue as data, one shard at a time,
                     // and waits for room rather than overshooting the bound.
+                    let mut queued = 0;
                     for (offset, shard) in out.into_iter().enumerate() {
                         #[cfg(test)]
                         state.count_parity();
+                        let bytes = shard.len();
                         if !state
                             .add_shard_waiting(id, first + offset, Bytes::from(shard))
                             .await
                         {
                             break;
                         }
+                        state.held_sub(bytes);
+                        queued += 1;
+                    }
+                    // A batch stopped by a cancel still holds the shards it did
+                    // not hand over.
+                    if queued < PARITY_BATCH.min(total - first) {
+                        let left: usize = PARITY_BATCH.min(total - first).saturating_sub(queued)
+                            * size;
+                        state.held_sub(left);
                     }
                     state.notify_work();
                 }
@@ -1580,6 +1607,52 @@ mod tests {
             slabs[0].sectors.len(),
             30,
             "ten data shards and the parity produced from them"
+        );
+    }
+
+    /// A cancel while a parity batch is being computed stops the encoder: the
+    /// rest of the slab is never produced.
+    #[sia_core_derive::cross_target_test]
+    async fn test_cancel_during_a_parity_batch() {
+        use sia_core::rhp4::SECTOR_SIZE;
+
+        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
+        let mut upload = Upload::new(
+            hosts,
+            app_client::Client::mock(),
+            Arc::new(AppKey::import(rand::random())),
+            UploadOptions::default(),
+        )
+        .unwrap();
+        let id = upload
+            .open_data_slab(EncryptionKey::from([3u8; 32]), SECTOR_SIZE)
+            .await
+            .unwrap()
+            .expect("a slab opens while the upload is live");
+        // Four mebibytes per shard, so the batch is still being computed when
+        // the cancel lands rather than finishing first.
+        for index in 0..10 {
+            upload
+                .add_data_shard(id, index, Bytes::from(vec![index as u8; SECTOR_SIZE]))
+                .await
+                .unwrap();
+        }
+        sleep(Duration::from_millis(20)).await;
+
+        let handle = upload.cancel_handle();
+        handle.cancel();
+        sleep(Duration::from_millis(500)).await;
+
+        assert!(handle.is_cancelled());
+        assert!(
+            upload.state.parity_shards() < 20,
+            "the encoder stopped part way: {} of 20 parity shards",
+            upload.state.parity_shards()
+        );
+        assert_eq!(
+            upload.encoders.available_permits(),
+            ENCODERS_IN_FLIGHT,
+            "the encoder released its slot"
         );
     }
 
