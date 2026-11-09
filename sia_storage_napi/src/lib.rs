@@ -1212,7 +1212,7 @@ fn remaining_of(length: u64, optimal_data_size: u64) -> u64 {
 
 #[cfg(test)]
 mod packed_remaining_tests {
-    use super::remaining_of;
+    use super::remaining_of as remaining;
 
     #[test]
     fn a_full_slab_reports_a_whole_slab_free() {
