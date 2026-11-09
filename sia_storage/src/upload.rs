@@ -397,6 +397,10 @@ impl Upload {
             options.shard_attempt.clone(),
         ));
         let slab_buffer = SlabReader::new(options.data_shards as usize);
+        // The reader keeps this much resident for the whole upload: it replaces
+        // the buffers when a slab fills, and the replaced set becomes the
+        // encoder's plaintext.
+        state.held_put("reader".into(), slab_buffer.allocated_bytes());
         Ok(Self {
             client,
             app_key,
@@ -572,8 +576,6 @@ impl Upload {
                 // batches only split its output.
                 let inputs: Vec<Bytes> = open.plain.iter().flatten().cloned().collect();
                 let plain_bytes: usize = inputs.iter().map(Bytes::len).sum();
-                // The reader's entry becomes this slab's plaintext entry.
-                state.held_remove("reader");
                 let mut plain_held =
                     HeldBytes::new(&state, format!("plain:{}", id.0), plain_bytes);
                 for first in (data_shards..total).step_by(PARITY_BATCH) {
@@ -590,17 +592,17 @@ impl Upload {
                     let mut out = maybe_spawn_blocking!({
                         encode_batch(&batch_coder, &inputs, first, count, size)
                     })?;
-                    for (offset, shard) in out.iter_mut().enumerate() {
-                        encrypt_shard(&key, (first + offset) as u8, 0, shard);
-                    }
-                    // The batch is held until its shards are queued: it is real
-                    // memory at the cap, so the count includes it.
+                    // Counted before encryption: the buffers exist from the
+                    // moment the encoder produced them.
                     let batch_bytes: usize = out.iter().map(Vec::len).sum();
                     let mut batch_held = HeldBytes::new(
                         &state,
                         format!("batch:{}:{}", id.0, first),
                         batch_bytes,
                     );
+                    for (offset, shard) in out.iter_mut().enumerate() {
+                        encrypt_shard(&key, (first + offset) as u8, 0, shard);
+                    }
                     // Parity takes the same queue as data, one shard at a time,
                     // and waits for room rather than overshooting the bound.
                     for (offset, shard) in out.into_iter().enumerate() {
@@ -655,11 +657,7 @@ impl Upload {
             .unwrap()
             .read_shards(data_key, reader)
             .await?;
-        if let Some(slab) = &slab {
-            // The reader allocated this slab's buffers; the encoder that takes
-            // them adopts this entry.
-            self.state.held_put("reader".into(), slab.bytes());
-        }
+
         Ok((read, slab))
     }
 
@@ -695,9 +693,7 @@ impl Upload {
     /// for every registered slab to be pinned by a worker.
     pub(crate) async fn finish(mut self) -> Result<Vec<Slab>, UploadError> {
         let last_slab = self.slab_buffer.take().unwrap().finish();
-        if let Some(slab) = &last_slab {
-            self.state.held_put("reader".into(), slab.bytes());
-        }
+
         if let Some(slab) = last_slab {
             self.ensure_hosts().await?;
             if let Some(id) = self.open_data_slab(slab.encryption_key, slab.length).await? {
@@ -1556,9 +1552,13 @@ mod tests {
         )
         .unwrap();
 
-        // Nothing is held before a slab is read: the reader's buffers are
-        // counted when it allocates them for a slab.
-        assert_eq!(upload.held_bytes(), 0);
+        // The reader keeps its ten shard buffers and the landing buffer for the
+        // life of the upload, so they are held before anything is read.
+        let reader_held = upload.held_bytes();
+        assert!(
+            reader_held >= 10 * SECTOR_SIZE,
+            "the reader's buffers are held: {reader_held}"
+        );
         let size = upload.optimal_data_size();
         let (_, slab) = upload
             .next_slab(
@@ -1570,8 +1570,8 @@ mod tests {
         assert!(slab.is_some(), "a full slab was read");
         assert_eq!(
             upload.held_bytes(),
-            10 * SECTOR_SIZE,
-            "the slab being read is held"
+            reader_held,
+            "reading a slab does not add a second reader buffer to the count"
         );
 
         let id = upload
@@ -1586,10 +1586,10 @@ mod tests {
 
         assert_eq!(
             upload.held_bytes(),
-            11 * SECTOR_SIZE,
-            "the read slab plus one queued shard"
+            reader_held + SECTOR_SIZE,
+            "the reader's buffers plus one queued shard"
         );
-        assert_eq!(upload.peak_held_bytes(), 11 * SECTOR_SIZE);
+        assert_eq!(upload.peak_held_bytes(), reader_held + SECTOR_SIZE);
 
         upload.state.shutdown();
         assert_eq!(upload.held_bytes(), 0, "a stopped upload holds nothing");
@@ -1666,16 +1666,20 @@ mod tests {
         }
         sleep(Duration::from_millis(20)).await;
 
+        // Count what is in progress when the cancel lands; at most that batch
+        // may finish, and no later one may start.
+        let at_cancel = upload.state.parity_shards();
         let handle = upload.cancel_handle();
         handle.cancel();
         sleep(Duration::from_millis(500)).await;
 
         assert!(handle.is_cancelled());
+        let produced = upload.state.parity_shards();
         assert!(
-            upload.state.parity_shards() < 20,
-            "the encoder stopped part way: {} of 20 parity shards",
-            upload.state.parity_shards()
+            produced <= at_cancel + PARITY_BATCH,
+            "at most the batch in progress finished: {at_cancel} then {produced}"
         );
+        assert!(produced < 20, "the slab was not finished");
         assert_eq!(
             upload.encoders.available_permits(),
             ENCODERS_IN_FLIGHT,

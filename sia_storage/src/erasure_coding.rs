@@ -121,15 +121,6 @@ pub(crate) struct SlabData {
     pub shards: Vec<Vec<u8>>,
 }
 
-impl SlabData {
-    /// Bytes the slab occupies. Counted when the slab is read and released when
-    /// the encoder that owns it finishes, so the reader term is a live
-    /// allocation rather than the one it allocated at construction.
-    pub(crate) fn bytes(&self) -> usize {
-        self.shards.iter().map(Vec::len).sum()
-    }
-}
-
 /// Reads as many bytes as possible from `r` into `buf`, stopping at end of
 /// input. Returns the number of bytes read.
 ///
@@ -148,6 +139,12 @@ async fn fill_buf<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> io::Result
 }
 
 impl SlabReader {
+    /// Bytes this reader keeps resident: its ten data shards and the landing
+    /// buffer. It exists for the life of the upload, so it is counted once.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.shards.iter().map(Vec::capacity).sum::<usize>() + self.read_buffer.capacity()
+    }
+
     pub(crate) fn new(data_shards: usize) -> Self {
         Self {
             data_shards,

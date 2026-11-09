@@ -148,10 +148,15 @@ impl WorkerState {
         if self.is_closed() {
             return false;
         }
-        self.queue
+        let queued = self
+            .queue
             .lock()
             .unwrap()
-            .add_shard_if_room(id, index, data, super::QUEUE_HIGH_WATER)
+            .add_shard_if_room(id, index, data, super::QUEUE_HIGH_WATER);
+        if queued {
+            self.sample_peak();
+        }
+        queued
     }
 
     /// Queues one shard, waiting for room rather than dropping it. The queue
@@ -203,6 +208,14 @@ impl WorkerState {
     /// Releases what was held under a name.
     pub(crate) fn held_remove(&self, name: &str) {
         self.held.lock().unwrap().remove(name);
+        self.sample_peak();
+    }
+
+    /// Samples the peak, so a change between callers is still the high-water
+    /// mark rather than whatever the next reader happens to see.
+    pub(crate) fn sample_peak(&self) {
+        let bytes = self.held_bytes();
+        self.peak_held.fetch_max(bytes, Ordering::Relaxed);
     }
 
     /// Bytes held right now: what the queue holds plus the named allocations.
@@ -429,6 +442,7 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
                     uploaded_at: Some(uploaded_at),
                 };
                 let finished = { state.queue.lock().unwrap().placed(&host, &request, placed) };
+                state.sample_peak();
                 drop(permit);
                 if let Some(finished) = finished {
                     pin(&state, finished).await;
@@ -447,6 +461,7 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
                     // The shard goes back to the queue, so its bytes are still
                     // held. Only a shard that leaves the upload is released.
                     state.queue.lock().unwrap().failed(request);
+                    state.sample_peak();
                     state.work.notify_waiters();
                     ensure_workers(&state);
                     return;
@@ -471,6 +486,7 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
                 // line per ban keeps the log readable and the count honest.
                 state.pool.lock().unwrap().leave(host, LeaveReason::Failed(reason));
                 state.queue.lock().unwrap().failed(request);
+                state.sample_peak();
                 debug!(
                     "[pool] {} left: {}",
                     short(&host),
