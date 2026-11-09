@@ -1512,6 +1512,48 @@ mod tests {
         assert_eq!(upload.held_bytes(), 0, "a stopped upload holds nothing");
     }
 
+    /// Shards added one at a time, through the same calls `registerSlab` and
+    /// `addShard` use, assemble a slab that pins with all thirty sectors.
+    #[sia_core_derive::cross_target_test]
+    async fn test_a_slab_can_be_built_from_individual_shards() {
+        use sia_core::rhp4::SECTOR_SIZE;
+
+        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
+        hosts.update(
+            (0..30)
+                .map(|_| test_host(PrivateKey::from_seed(&rand::random()).public_key()))
+                .collect(),
+            true,
+        );
+        let mut upload = Upload::new(
+            hosts,
+            app_client::Client::mock(),
+            Arc::new(AppKey::import(rand::random())),
+            UploadOptions::default(),
+        )
+        .unwrap();
+        upload.ensure_hosts().await.unwrap();
+
+        let id = upload
+            .open_data_slab(EncryptionKey::from([3u8; 32]), SECTOR_SIZE)
+            .await
+            .unwrap()
+            .expect("a slab opens while the upload is live");
+        for index in 0..10 {
+            upload
+                .add_data_shard(id, index, Bytes::from(vec![index as u8; SECTOR_SIZE]))
+                .unwrap();
+        }
+
+        let slabs = upload.finish().await.unwrap();
+        assert_eq!(slabs.len(), 1);
+        assert_eq!(
+            slabs[0].sectors.len(),
+            30,
+            "ten data shards and the parity produced from them"
+        );
+    }
+
     /// A pinned slab is reported when the upload is cancelled, which is what a
     /// caller resumes from.
     #[sia_core_derive::cross_target_test]
