@@ -335,6 +335,39 @@ struct OpenSlab {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+/// Shard bytes held for as long as it lives, released even when the work that
+/// holds them fails part way. Encoding can return early, so the count is kept by
+/// a drop rather than by a line at the end of each path.
+struct HeldBytes {
+    state: Arc<worker::WorkerState>,
+    bytes: usize,
+}
+
+impl HeldBytes {
+    fn new(state: &Arc<worker::WorkerState>, bytes: usize) -> Self {
+        state.held_add(bytes);
+        Self {
+            state: state.clone(),
+            bytes,
+        }
+    }
+
+    /// Releases bytes that have moved into the queue.
+    fn release(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        self.state.held_sub(bytes);
+    }
+}
+
+impl Drop for HeldBytes {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.state.held_sub(self.bytes);
+        }
+    }
+}
+
 impl Upload {
     pub(crate) fn new(
         client: Hosts,
@@ -536,7 +569,7 @@ impl Upload {
                 // batches only split its output.
                 let inputs: Vec<Bytes> = open.plain.iter().flatten().cloned().collect();
                 let plain_bytes: usize = inputs.iter().map(Bytes::len).sum();
-                state.held_add(plain_bytes);
+                let mut plain_held = HeldBytes::new(&state, plain_bytes);
                 for first in (data_shards..total).step_by(PARITY_BATCH) {
                     // Cancelled while encoding: stop before the next batch rather
                     // than finish work whose shards nobody will write.
@@ -557,10 +590,9 @@ impl Upload {
                     // The batch is held until its shards are queued: it is real
                     // memory at the cap, so the count includes it.
                     let batch_bytes: usize = out.iter().map(Vec::len).sum();
-                    state.held_add(batch_bytes);
+                    let mut batch_held = HeldBytes::new(&state, batch_bytes);
                     // Parity takes the same queue as data, one shard at a time,
                     // and waits for room rather than overshooting the bound.
-                    let mut queued = 0;
                     for (offset, shard) in out.into_iter().enumerate() {
                         #[cfg(test)]
                         state.count_parity();
@@ -571,19 +603,11 @@ impl Upload {
                         {
                             break;
                         }
-                        state.held_sub(bytes);
-                        queued += 1;
-                    }
-                    // A batch stopped by a cancel still holds the shards it did
-                    // not hand over.
-                    if queued < PARITY_BATCH.min(total - first) {
-                        let left: usize = PARITY_BATCH.min(total - first).saturating_sub(queued)
-                            * size;
-                        state.held_sub(left);
+                        batch_held.release(bytes);
                     }
                     state.notify_work();
                 }
-                state.held_sub(plain_bytes);
+                plain_held.release(plain_bytes);
                 debug!("[upload] slab {} encoded in {:?}", id.0, started.elapsed());
                 Ok(())
             }
