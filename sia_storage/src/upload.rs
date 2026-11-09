@@ -1508,6 +1508,34 @@ mod tests {
         );
     }
 
+    /// A release after a stop does not wrap the count on a 32-bit target, where
+    /// the wrapped value would read as four gigabytes held.
+    #[sia_core_derive::cross_target_test]
+    async fn test_held_bytes_does_not_wrap_after_a_stop() {
+        use sia_core::rhp4::SECTOR_SIZE;
+
+        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
+        let upload = Upload::new(
+            hosts,
+            app_client::Client::mock(),
+            Arc::new(AppKey::import(rand::random())),
+            UploadOptions::default(),
+        )
+        .unwrap();
+        let before = upload.peak_held_bytes();
+        upload.state.shutdown();
+        assert_eq!(upload.held_bytes(), 0, "a stopped upload holds nothing");
+
+        // A shard released after the stop must saturate, not wrap.
+        upload.state.held_sub(SECTOR_SIZE);
+        assert_eq!(upload.held_bytes(), 0);
+        assert_eq!(
+            upload.peak_held_bytes(),
+            before,
+            "the peak does not pick up a wrapped count"
+        );
+    }
+
     /// Held bytes count the reader's buffer and the shards in the queue, and
     /// the peak keeps the highest value seen whether or not anyone samples.
     #[sia_core_derive::cross_target_test]

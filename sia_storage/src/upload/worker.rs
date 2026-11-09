@@ -155,8 +155,24 @@ impl WorkerState {
     }
 
     /// Releases shard bytes the upload no longer holds.
+    ///
+    /// Saturating rather than wrapping: a shard can be released after a stop
+    /// has already zeroed the count, and on wasm32 a wrap would read as four
+    /// gigabytes held for the rest of the upload.
     pub(crate) fn held_sub(&self, bytes: usize) {
-        self.held.fetch_sub(bytes, Ordering::Relaxed);
+        let mut held = self.held.load(Ordering::Relaxed);
+        loop {
+            let next = held.saturating_sub(bytes);
+            match self.held.compare_exchange_weak(
+                held,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => held = actual,
+            }
+        }
     }
 
     /// Bytes held right now, as the upload counts them.
