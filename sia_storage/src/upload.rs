@@ -561,6 +561,12 @@ impl Upload {
         let size = open.plain[0].as_ref().map(|shard| shard.len()).unwrap_or(0);
         maybe_spawn!(async move {
             let encoded: Result<(), UploadError> = async move {
+                // Bound as a whole first, then taken: an `async move` captures
+                // only the fields it uses, so leaving the slot inside `open`
+                // would release it as soon as this function returned and the
+                // gate would never hold.
+                let mut open = open;
+                let _slot = open._permit.take();
                 let started = Instant::now();
                 // The plaintext is the encoder's input for every batch; the
                 // batches only split its output.
