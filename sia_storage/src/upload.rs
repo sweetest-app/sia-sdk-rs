@@ -340,22 +340,16 @@ struct OpenSlab {
 /// a drop rather than by a line at the end of each path.
 struct HeldBytes {
     state: Arc<worker::WorkerState>,
+    name: String,
     bytes: usize,
 }
 
 impl HeldBytes {
-    /// Counts bytes that are already counted elsewhere.
-    fn adopt(state: &Arc<worker::WorkerState>, bytes: usize) -> Self {
+    fn new(state: &Arc<worker::WorkerState>, name: String, bytes: usize) -> Self {
+        state.held_put(name.clone(), bytes);
         Self {
             state: state.clone(),
-            bytes,
-        }
-    }
-
-    fn new(state: &Arc<worker::WorkerState>, bytes: usize) -> Self {
-        state.held_add(bytes);
-        Self {
-            state: state.clone(),
+            name,
             bytes,
         }
     }
@@ -364,15 +358,13 @@ impl HeldBytes {
     fn release(&mut self, bytes: usize) {
         let bytes = bytes.min(self.bytes);
         self.bytes -= bytes;
-        self.state.held_sub(bytes);
+        self.state.held_put(self.name.clone(), self.bytes);
     }
 }
 
 impl Drop for HeldBytes {
     fn drop(&mut self) {
-        if self.bytes > 0 {
-            self.state.held_sub(self.bytes);
-        }
+        self.state.held_remove(&self.name);
     }
 }
 
@@ -574,9 +566,10 @@ impl Upload {
                 // batches only split its output.
                 let inputs: Vec<Bytes> = open.plain.iter().flatten().cloned().collect();
                 let plain_bytes: usize = inputs.iter().map(Bytes::len).sum();
-                // Counted when the reader produced the slab; this takes over the
-                // count and releases it when the encoder is done.
-                let mut plain_held = HeldBytes::adopt(&state, plain_bytes);
+                // The reader's entry becomes this slab's plaintext entry.
+                state.held_remove("reader");
+                let mut plain_held =
+                    HeldBytes::new(&state, format!("plain:{}", id.0), plain_bytes);
                 for first in (data_shards..total).step_by(PARITY_BATCH) {
                     // Cancelled while encoding: stop before the next batch rather
                     // than finish work whose shards nobody will write.
@@ -597,7 +590,11 @@ impl Upload {
                     // The batch is held until its shards are queued: it is real
                     // memory at the cap, so the count includes it.
                     let batch_bytes: usize = out.iter().map(Vec::len).sum();
-                    let mut batch_held = HeldBytes::new(&state, batch_bytes);
+                    let mut batch_held = HeldBytes::new(
+                        &state,
+                        format!("batch:{}:{}", id.0, first),
+                        batch_bytes,
+                    );
                     // Parity takes the same queue as data, one shard at a time,
                     // and waits for room rather than overshooting the bound.
                     for (offset, shard) in out.into_iter().enumerate() {
@@ -653,9 +650,9 @@ impl Upload {
             .read_shards(data_key, reader)
             .await?;
         if let Some(slab) = &slab {
-            // The reader allocated this slab's buffers; they are held until the
-            // encoder that takes them finishes.
-            self.state.held_add(slab.bytes());
+            // The reader allocated this slab's buffers; the encoder that takes
+            // them adopts this entry.
+            self.state.held_put("reader".into(), slab.bytes());
         }
         Ok((read, slab))
     }
@@ -693,7 +690,7 @@ impl Upload {
     pub(crate) async fn finish(mut self) -> Result<Vec<Slab>, UploadError> {
         let last_slab = self.slab_buffer.take().unwrap().finish();
         if let Some(slab) = &last_slab {
-            self.state.held_add(slab.bytes());
+            self.state.held_put("reader".into(), slab.bytes());
         }
         if let Some(slab) = last_slab {
             self.ensure_hosts().await?;
@@ -1534,34 +1531,6 @@ mod tests {
             upload.state.queued(),
             before,
             "a cancelled upload queues nothing, and the encoder produces no parity"
-        );
-    }
-
-    /// A release after a stop does not wrap the count on a 32-bit target, where
-    /// the wrapped value would read as four gigabytes held.
-    #[sia_core_derive::cross_target_test]
-    async fn test_held_bytes_does_not_wrap_after_a_stop() {
-        use sia_core::rhp4::SECTOR_SIZE;
-
-        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
-        let upload = Upload::new(
-            hosts,
-            app_client::Client::mock(),
-            Arc::new(AppKey::import(rand::random())),
-            UploadOptions::default(),
-        )
-        .unwrap();
-        let before = upload.peak_held_bytes();
-        upload.state.shutdown();
-        assert_eq!(upload.held_bytes(), 0, "a stopped upload holds nothing");
-
-        // A shard released after the stop must saturate, not wrap.
-        upload.state.held_sub(SECTOR_SIZE);
-        assert_eq!(upload.held_bytes(), 0);
-        assert_eq!(
-            upload.peak_held_bytes(),
-            before,
-            "the peak does not pick up a wrapped count"
         );
     }
 

@@ -27,6 +27,10 @@ pub(crate) struct RequestQueue {
     slabs: HashMap<SlabId, SlabTracker>,
     pending: Vec<ShardRequest>,
     next_slab: u64,
+    /// Bytes of the shards a host has taken and not yet acknowledged. They leave
+    /// `pending` on take, so they are counted here until the write finishes or the
+    /// shard goes back.
+    taken: usize,
 }
 
 impl RequestQueue {
@@ -97,7 +101,9 @@ impl RequestQueue {
             }
         }
         let (_, _, index) = best?;
-        Some(self.pending.swap_remove(index))
+        let request = self.pending.swap_remove(index);
+        self.taken += request.data.len();
+        Some(request)
     }
 
     /// Records a placed shard. Returns the finished slab once every shard has
@@ -108,6 +114,7 @@ impl RequestQueue {
         request: &ShardRequest,
         sector: SectorPinParams,
     ) -> Option<FinishedSlab> {
+        self.taken = self.taken.saturating_sub(request.data.len());
         let slab = self.slabs.get_mut(&request.slab)?;
         if !slab.record(request.shard, *host, sector) {
             return None;
@@ -121,6 +128,7 @@ impl RequestQueue {
     /// Puts a shard back, for a host that failed. The host is not recorded as
     /// having served the slab, so another host may take the same shard.
     pub(crate) fn failed(&mut self, request: ShardRequest) {
+        self.taken = self.taken.saturating_sub(request.data.len());
         self.pending.push(request);
     }
 
@@ -151,10 +159,17 @@ impl RequestQueue {
         self.pending.len()
     }
 
+    /// Bytes of shards waiting for a host or being written. Derived from the
+    /// requests themselves, so it cannot drift from what is held.
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.pending.iter().map(|r| r.data.len()).sum::<usize>() + self.taken
+    }
+
     /// Abandons every slab and drops the work still queued for it. Called when
     /// the upload is cancelled, so nothing is written for a slab nobody wants.
     pub(crate) fn cancel_all(&mut self) {
         self.pending.clear();
+        self.taken = 0;
         for tracker in self.slabs.values_mut() {
             tracker.cancel();
         }

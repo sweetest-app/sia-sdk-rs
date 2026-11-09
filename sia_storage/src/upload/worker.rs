@@ -63,10 +63,11 @@ pub(crate) struct WorkerState {
     /// mid-encode is observed rather than inferred.
     #[cfg(test)]
     pub(crate) parity_shards: AtomicUsize,
-    /// Shard bytes held by the upload right now: queued shards, the shards a
-    /// host is writing, and parity being encoded. The reader's buffer is added
-    /// by the upload itself.
-    held: AtomicUsize,
+    /// Bytes held outside the queue, by name: the slab being read, a slab's
+    /// plaintext while it encodes, and a parity batch until it is queued. Named
+    /// rather than summed, so the count is what is actually held instead of a
+    /// running total that can drift.
+    held: Mutex<std::collections::HashMap<String, usize>>,
     /// The highest `held` has ever been, so a caller does not have to sample it
     /// often enough to catch the peak.
     peak_held: AtomicUsize,
@@ -116,7 +117,7 @@ impl WorkerState {
             app_key,
             #[cfg(test)]
             parity_shards: AtomicUsize::new(0),
-            held: AtomicUsize::new(0),
+            held: Mutex::new(std::collections::HashMap::new()),
             peak_held: AtomicUsize::new(0),
             pinned: Mutex::new(Vec::new()),
             registered: AtomicUsize::new(0),
@@ -147,15 +148,10 @@ impl WorkerState {
         if self.is_closed() {
             return false;
         }
-        let queued = self
-            .queue
+        self.queue
             .lock()
             .unwrap()
-            .add_shard_if_room(id, index, data.clone(), super::QUEUE_HIGH_WATER);
-        if queued {
-            self.held_add(data.len());
-        }
-        queued
+            .add_shard_if_room(id, index, data, super::QUEUE_HIGH_WATER)
     }
 
     /// Queues one shard, waiting for room rather than dropping it. The queue
@@ -190,36 +186,31 @@ impl WorkerState {
         self.parity_shards.load(Ordering::Relaxed)
     }
 
-    /// Adds to the shard bytes the upload is holding, and remembers the peak.
-    pub(crate) fn held_add(&self, bytes: usize) {
-        let now = self.held.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        self.peak_held.fetch_max(now, Ordering::Relaxed);
-    }
-
-    /// Releases shard bytes the upload no longer holds.
-    ///
-    /// Saturating rather than wrapping: a shard can be released after a stop
-    /// has already zeroed the count, and on wasm32 a wrap would read as four
-    /// gigabytes held for the rest of the upload.
-    pub(crate) fn held_sub(&self, bytes: usize) {
-        let mut held = self.held.load(Ordering::Relaxed);
-        loop {
-            let next = held.saturating_sub(bytes);
-            match self.held.compare_exchange_weak(
-                held,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => held = actual,
+    /// Records bytes held under a name, replacing any earlier value.
+    pub(crate) fn held_put(&self, name: String, bytes: usize) {
+        let current = {
+            let mut held = self.held.lock().unwrap();
+            if bytes == 0 {
+                held.remove(&name);
+            } else {
+                held.insert(name, bytes);
             }
-        }
+            self.queue.lock().unwrap().held_bytes() + held.values().sum::<usize>()
+        };
+        self.peak_held.fetch_max(current, Ordering::Relaxed);
     }
 
-    /// Bytes held right now, as the upload counts them.
+    /// Releases what was held under a name.
+    pub(crate) fn held_remove(&self, name: &str) {
+        self.held.lock().unwrap().remove(name);
+    }
+
+    /// Bytes held right now: what the queue holds plus the named allocations.
     pub(crate) fn held_bytes(&self) -> usize {
-        self.held.load(Ordering::Relaxed)
+        let held = self.held.lock().unwrap();
+        let bytes = self.queue.lock().unwrap().held_bytes() + held.values().sum::<usize>();
+        self.peak_held.fetch_max(bytes, Ordering::Relaxed);
+        bytes
     }
 
     /// The highest `held_bytes` has been.
@@ -303,7 +294,7 @@ impl WorkerState {
         self.closed.store(true, Ordering::SeqCst);
         // Every shard in flight is dropped with the workers, so nothing is held
         // afterwards. The peak stays where it got to.
-        self.held.store(0, Ordering::Relaxed);
+        self.held.lock().unwrap().clear();
         self.work.notify_waiters();
         // Nothing is written for a slab nobody wants any more: the queue drops
         // its pending shards and every slab that is not pinned is abandoned.
@@ -438,7 +429,6 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
                     uploaded_at: Some(uploaded_at),
                 };
                 let finished = { state.queue.lock().unwrap().placed(&host, &request, placed) };
-                state.held_sub(request.data.len());
                 drop(permit);
                 if let Some(finished) = finished {
                     pin(&state, finished).await;
