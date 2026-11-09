@@ -229,11 +229,18 @@ cfg_if::cfg_if! {
 
         pub(crate) fn mul_slice(coeff: u8, input: &[u8], out: &mut [u8]) {
             debug_assert_eq!(input.len(), out.len());
+            // Shorter than one vector: the table walk skips the register setup.
+            if input.len() < 16 {
+                return scalar::mul_slice(coeff, input, out);
+            }
             neon::mul_slice(coeff, input, out)
         }
 
         pub(crate) fn mul_slice_xor(coeff: u8, input: &[u8], out: &mut [u8]) {
             debug_assert_eq!(input.len(), out.len());
+            if input.len() < 16 {
+                return scalar::mul_slice_xor(coeff, input, out);
+            }
             neon::mul_slice_xor(coeff, input, out)
         }
     } else if #[cfg(all(
@@ -245,11 +252,18 @@ cfg_if::cfg_if! {
 
         pub(crate) fn mul_slice(coeff: u8, input: &[u8], out: &mut [u8]) {
             debug_assert_eq!(input.len(), out.len());
+            // Shorter than one vector: the table walk skips the register setup.
+            if input.len() < 16 {
+                return scalar::mul_slice(coeff, input, out);
+            }
             wasm::mul_slice(coeff, input, out)
         }
 
         pub(crate) fn mul_slice_xor(coeff: u8, input: &[u8], out: &mut [u8]) {
             debug_assert_eq!(input.len(), out.len());
+            if input.len() < 16 {
+                return scalar::mul_slice_xor(coeff, input, out);
+            }
             wasm::mul_slice_xor(coeff, input, out)
         }
     } else {

@@ -4,7 +4,6 @@
 use super::MUL_TABLE;
 
 #[inline]
-#[allow(dead_code)]
 pub(super) fn mul_slice(coeff: u8, input: &[u8], out: &mut [u8]) {
     debug_assert_eq!(input.len(), out.len());
     let table: &[u8; 256] = &MUL_TABLE[coeff as usize];
@@ -26,7 +25,6 @@ pub(super) fn mul_slice(coeff: u8, input: &[u8], out: &mut [u8]) {
 }
 
 #[inline]
-#[allow(dead_code)]
 pub(super) fn mul_slice_xor(coeff: u8, input: &[u8], out: &mut [u8]) {
     debug_assert_eq!(input.len(), out.len());
     let table: &[u8; 256] = &MUL_TABLE[coeff as usize];
