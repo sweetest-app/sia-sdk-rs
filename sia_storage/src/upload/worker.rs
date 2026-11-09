@@ -59,6 +59,10 @@ pub(crate) struct WorkerState {
     /// Finished slabs, indexed by slab order. Filled by whichever worker pins
     /// the last shard of a slab.
     pinned: Mutex<Vec<Option<Slab>>>,
+    /// Parity shards handed to the queue. Test only: it is how a cancel landing
+    /// mid-encode is observed rather than inferred.
+    #[cfg(test)]
+    pub(crate) parity_shards: AtomicUsize,
     /// Shard bytes held by the upload right now: queued shards, the shards a
     /// host is writing, and parity being encoded. The reader's buffer is added
     /// by the upload itself.
@@ -110,6 +114,8 @@ impl WorkerState {
             client,
             api_client,
             app_key,
+            #[cfg(test)]
+            parity_shards: AtomicUsize::new(0),
             held: AtomicUsize::new(0),
             peak_held: AtomicUsize::new(0),
             pinned: Mutex::new(Vec::new()),
@@ -146,6 +152,18 @@ impl WorkerState {
             self.held_add(data.len());
         }
         queued
+    }
+
+    /// Counts one parity shard handed to the queue.
+    #[cfg(test)]
+    pub(crate) fn count_parity(&self) {
+        self.parity_shards.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Parity shards queued so far.
+    #[cfg(test)]
+    pub(crate) fn parity_shards(&self) -> usize {
+        self.parity_shards.load(Ordering::Relaxed)
     }
 
     /// Adds to the shard bytes the upload is holding, and remembers the peak.
@@ -412,9 +430,9 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
                         short(&host)
                     );
                     state.pool.lock().unwrap().leave(host, LeaveReason::Closed);
-                    let dropped = request.data.len();
+                    // The shard goes back to the queue, so its bytes are still
+                    // held. Only a shard that leaves the upload is released.
                     state.queue.lock().unwrap().failed(request);
-                    state.held_sub(dropped);
                     state.work.notify_waiters();
                     ensure_workers(&state);
                     return;
@@ -438,9 +456,7 @@ async fn run_worker(state: Arc<WorkerState>, host: PublicKey) {
                 // The pool logs the ban itself, with the counts it owns. One
                 // line per ban keeps the log readable and the count honest.
                 state.pool.lock().unwrap().leave(host, LeaveReason::Failed(reason));
-                let dropped = request.data.len();
                 state.queue.lock().unwrap().failed(request);
-                state.held_sub(dropped);
                 debug!(
                     "[pool] {} left: {}",
                     short(&host),

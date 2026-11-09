@@ -539,7 +539,23 @@ impl Upload {
                     for (offset, shard) in out.iter_mut().enumerate() {
                         encrypt_shard(&key, (first + offset) as u8, 0, shard);
                     }
+                    // Parity waits for room before it hands a batch over, the
+                    // same way the reader waits before it reads. Without this
+                    // the high water only bounded the reader: an encoder could
+                    // add a whole batch, and a slab opened at the threshold
+                    // could put thirty shards in the queue.
+                    while state.queued() > QUEUE_HIGH_WATER {
+                        if state.is_closed() {
+                            break;
+                        }
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                    if state.is_closed() {
+                        break;
+                    }
                     for (offset, shard) in out.into_iter().enumerate() {
+                        #[cfg(test)]
+                        state.count_parity();
                         slab::Placement::enqueue(&*state, id, first + offset, Bytes::from(shard));
                     }
                     state.notify_work();
@@ -1618,6 +1634,69 @@ mod tests {
             slabs[0].sectors.len(),
             30,
             "ten data shards and the parity produced from them"
+        );
+    }
+
+    /// A cancel that lands while a parity batch is waiting for room stops the
+    /// encoder: the batch is not handed over, and no later batch is produced.
+    #[sia_core_derive::cross_target_test]
+    async fn test_cancel_while_a_parity_batch_waits_for_room() {
+        use sia_core::rhp4::SECTOR_SIZE;
+
+        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
+        // No hosts write anything, so the queue only grows and the encoder has
+        // to wait for room it will never get.
+        let mut upload = Upload::new(
+            hosts,
+            app_client::Client::mock(),
+            Arc::new(AppKey::import(rand::random())),
+            UploadOptions::default(),
+        )
+        .unwrap();
+        let id = upload
+            .open_data_slab(EncryptionKey::from([3u8; 32]), SECTOR_SIZE)
+            .await
+            .unwrap()
+            .expect("a slab opens while the upload is live");
+        for index in 0..10 {
+            upload
+                .add_data_shard(id, index, Bytes::from(vec![index as u8; SECTOR_SIZE]))
+                .unwrap();
+        }
+
+        // The queue passes the high water and the encoder parks before handing
+        // over its next batch.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while upload.state.queued() <= QUEUE_HIGH_WATER && Instant::now() < deadline {
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            upload.state.queued() > QUEUE_HIGH_WATER,
+            "the queue filled: {} shards",
+            upload.state.queued()
+        );
+        let before = upload.state.parity_shards();
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            upload.state.parity_shards(),
+            before,
+            "the encoder is waiting for room, not producing"
+        );
+
+        let handle = upload.cancel_handle();
+        handle.cancel();
+        sleep(Duration::from_millis(100)).await;
+
+        assert!(handle.is_cancelled());
+        assert_eq!(
+            upload.state.parity_shards(),
+            before,
+            "no batch is handed over after the cancel"
+        );
+        assert_eq!(
+            upload.encoders.available_permits(),
+            ENCODERS_IN_FLIGHT,
+            "the encoder stopped and released its permit"
         );
     }
 

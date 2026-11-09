@@ -3,6 +3,25 @@
 //! Polynomial 0x11D, tables built at compile time. SIMD backends in submodules;
 //! the public `mul_slice` / `mul_slice_xor` dispatch at first call.
 
+// The scalar table walk is the dispatch itself on targets with no SIMD path,
+// and the reference the SIMD tests compare against. Where the dispatch never
+// calls it at runtime it is compiled for tests only, which is why it carries no
+// dead-code allowance.
+#[cfg(any(
+    test,
+    not(any(
+        all(
+            any(target_arch = "aarch64", target_arch = "arm64ec"),
+            target_feature = "neon",
+            feature = "simd",
+        ),
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "simd",
+        ),
+    )),
+))]
 mod scalar;
 
 const GENERATING_POLYNOMIAL: u16 = 0x11D;
@@ -229,18 +248,11 @@ cfg_if::cfg_if! {
 
         pub(crate) fn mul_slice(coeff: u8, input: &[u8], out: &mut [u8]) {
             debug_assert_eq!(input.len(), out.len());
-            // Shorter than one vector: the table walk skips the register setup.
-            if input.len() < 16 {
-                return scalar::mul_slice(coeff, input, out);
-            }
             neon::mul_slice(coeff, input, out)
         }
 
         pub(crate) fn mul_slice_xor(coeff: u8, input: &[u8], out: &mut [u8]) {
             debug_assert_eq!(input.len(), out.len());
-            if input.len() < 16 {
-                return scalar::mul_slice_xor(coeff, input, out);
-            }
             neon::mul_slice_xor(coeff, input, out)
         }
     } else if #[cfg(all(
@@ -252,18 +264,11 @@ cfg_if::cfg_if! {
 
         pub(crate) fn mul_slice(coeff: u8, input: &[u8], out: &mut [u8]) {
             debug_assert_eq!(input.len(), out.len());
-            // Shorter than one vector: the table walk skips the register setup.
-            if input.len() < 16 {
-                return scalar::mul_slice(coeff, input, out);
-            }
             wasm::mul_slice(coeff, input, out)
         }
 
         pub(crate) fn mul_slice_xor(coeff: u8, input: &[u8], out: &mut [u8]) {
             debug_assert_eq!(input.len(), out.len());
-            if input.len() < 16 {
-                return scalar::mul_slice_xor(coeff, input, out);
-            }
             wasm::mul_slice_xor(coeff, input, out)
         }
     } else {
