@@ -801,6 +801,7 @@ impl PackedUpload {
         let (_, slab, _) = slab.get_u64();
         let result = pu
             .add_shard(slab, index as usize, &data)
+            .await
             .map_err(|e| Error::from_reason(e.to_string()));
         *guard = Some(pu);
         result

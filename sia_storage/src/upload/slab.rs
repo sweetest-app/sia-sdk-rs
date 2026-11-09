@@ -192,11 +192,6 @@ pub(crate) trait Encoder {
     ) -> Result<(), String>;
 }
 
-/// Where produced shards go. The real implementation is the request queue.
-pub(crate) trait Placement {
-    fn enqueue(&self, slab: SlabId, index: usize, data: Bytes) -> bool;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

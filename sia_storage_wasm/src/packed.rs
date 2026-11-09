@@ -148,6 +148,7 @@ impl PackedUpload {
         let mut pu = guard.take().ok_or_else(|| JsError::new("upload closed"))?;
         let result = pu
             .add_shard(slab as u64, index as usize, data)
+            .await
             .map_err(to_js_err);
         *guard = Some(pu);
         result

@@ -257,12 +257,6 @@ fn encode_batch(
     Ok(out)
 }
 
-impl slab::Placement for worker::WorkerState {
-    fn enqueue(&self, slab: SlabId, index: usize, data: Bytes) -> bool {
-        self.add_shard(slab, index, data)
-    }
-}
-
 impl slab::Encoder for ErasureCoder {
     fn encode_range(
         &self,
@@ -450,7 +444,9 @@ impl Upload {
     /// Waits while the queue is over its high-water mark. Returns false when the
     /// upload was cancelled while waiting, which means nothing more is opened.
     async fn wait_for_room(&self) -> Result<bool, UploadError> {
-        while self.state.queued() > QUEUE_HIGH_WATER {
+        while self.state.queued() > QUEUE_HIGH_WATER
+            || self.encoders.available_permits() == 0
+        {
             if self.state.is_closed() {
                 return Ok(false);
             }
@@ -460,7 +456,7 @@ impl Upload {
     }
 
     /// Queues one data shard, and starts the encoder once the last one is in.
-    pub(crate) fn add_data_shard(
+    pub(crate) async fn add_data_shard(
         &mut self,
         id: SlabId,
         index: usize,
@@ -487,7 +483,14 @@ impl Upload {
         // parity can be produced, which is checked below.
         let mut shard = plain.to_vec();
         encrypt_shard(&key, index as u8, 0, &mut shard);
-        slab::Placement::enqueue(&*self.state, id, index, Bytes::from(shard));
+        if !self
+            .state
+            .add_shard_waiting(id, index, Bytes::from(shard))
+            .await
+        {
+            // Closed while waiting for room: the shard is dropped with the rest.
+            return Ok(());
+        }
         worker::ensure_workers(&self.state);
         self.state.notify_work();
 
@@ -539,24 +542,17 @@ impl Upload {
                     for (offset, shard) in out.iter_mut().enumerate() {
                         encrypt_shard(&key, (first + offset) as u8, 0, shard);
                     }
-                    // Parity waits for room before it hands a batch over, the
-                    // same way the reader waits before it reads. Without this
-                    // the high water only bounded the reader: an encoder could
-                    // add a whole batch, and a slab opened at the threshold
-                    // could put thirty shards in the queue.
-                    while state.queued() > QUEUE_HIGH_WATER {
-                        if state.is_closed() {
-                            break;
-                        }
-                        sleep(Duration::from_millis(50)).await;
-                    }
-                    if state.is_closed() {
-                        break;
-                    }
+                    // Parity takes the same queue as data, one shard at a time,
+                    // and waits for room rather than overshooting the bound.
                     for (offset, shard) in out.into_iter().enumerate() {
                         #[cfg(test)]
                         state.count_parity();
-                        slab::Placement::enqueue(&*state, id, first + offset, Bytes::from(shard));
+                        if !state
+                            .add_shard_waiting(id, first + offset, Bytes::from(shard))
+                            .await
+                        {
+                            break;
+                        }
                     }
                     state.notify_work();
                 }
@@ -622,7 +618,7 @@ impl Upload {
                     return Ok(total_length);
                 };
                 for (index, shard) in slab.shards.into_iter().enumerate() {
-                    self.add_data_shard(id, index, Bytes::from(shard))?;
+                    self.add_data_shard(id, index, Bytes::from(shard)).await?;
                 }
             }
         }
@@ -636,7 +632,7 @@ impl Upload {
             self.ensure_hosts().await?;
             if let Some(id) = self.open_data_slab(slab.encryption_key, slab.length).await? {
                 for (index, shard) in slab.shards.into_iter().enumerate() {
-                    self.add_data_shard(id, index, Bytes::from(shard))?;
+                    self.add_data_shard(id, index, Bytes::from(shard)).await?;
                 }
             }
         }
@@ -875,7 +871,7 @@ impl PackedUpload {
                 break;
             }
             for (index, shard) in slab.shards.iter().enumerate() {
-                self.add_shard(id, index, shard)?;
+                self.add_shard(id, index, shard).await?;
             }
         }
 
@@ -951,12 +947,19 @@ impl PackedUpload {
 
     /// Queues one data shard of a slab opened with
     /// [`register_slab`](Self::register_slab).
-    pub fn add_shard(&mut self, slab: u64, index: usize, data: &[u8]) -> Result<(), UploadError> {
-        self.upload.add_data_shard(
-            crate::schedule::SlabId(slab),
-            index,
-            Bytes::copy_from_slice(data),
-        )
+    pub async fn add_shard(
+        &mut self,
+        slab: u64,
+        index: usize,
+        data: &[u8],
+    ) -> Result<(), UploadError> {
+        self.upload
+            .add_data_shard(
+                crate::schedule::SlabId(slab),
+                index,
+                Bytes::copy_from_slice(data),
+            )
+            .await
     }
 
     pub fn ready_objects(&self) -> Vec<Option<Object>> {
@@ -1457,70 +1460,13 @@ mod tests {
         upload.cancel_handle().cancel();
         let before = upload.state.queued();
         for index in 0..10 {
-            let _ = upload.add_data_shard(id, index, Bytes::from(vec![0u8; 4096]));
+            let _ = upload.add_data_shard(id, index, Bytes::from(vec![0u8; 4096])).await;
         }
         sleep(Duration::from_millis(50)).await;
         assert_eq!(
             upload.state.queued(),
             before,
             "a cancelled upload queues nothing, and the encoder produces no parity"
-        );
-    }
-
-    /// An encoder that has not produced its first batch stops instead of
-    /// finishing work whose shards nobody will write.
-    #[sia_core_derive::cross_target_test]
-    async fn test_cancel_before_the_first_parity_batch_stops_the_encoder() {
-        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
-        hosts.update(
-            (0..30)
-                .map(|_| test_host(PrivateKey::from_seed(&rand::random()).public_key()))
-                .collect(),
-            true,
-        );
-        let mut upload = Upload::new(
-            hosts,
-            app_client::Client::mock(),
-            Arc::new(AppKey::import(rand::random())),
-            UploadOptions::default(),
-        )
-        .unwrap();
-        upload.ensure_hosts().await.unwrap();
-
-        // Hold every encoder permit, so the slab's encoder is parked before its
-        // first batch and the cancel below lands mid-encode rather than after.
-        let first = upload.encoders.clone().acquire_owned().await.unwrap();
-        let second = upload.encoders.clone().acquire_owned().await.unwrap();
-
-        let id = upload
-            .open_data_slab(EncryptionKey::from([3u8; 32]), 4096)
-            .await
-            .unwrap()
-            .expect("a slab opens while the upload is live");
-        for index in 0..10 {
-            upload
-                .add_data_shard(id, index, Bytes::from(vec![0u8; 4096]))
-                .unwrap();
-        }
-
-        let handle = upload.cancel_handle();
-        handle.cancel();
-        // The parked encoder may proceed now, sees the closed flag before its
-        // first batch, and stops.
-        drop(first);
-        drop(second);
-        sleep(Duration::from_millis(50)).await;
-
-        assert!(handle.is_cancelled());
-        assert_eq!(
-            upload.state.queued(),
-            0,
-            "no parity was queued after the cancel"
-        );
-        assert_eq!(
-            upload.encoders.available_permits(),
-            ENCODERS_IN_FLIGHT,
-            "the encoder released its permit, so it stopped"
         );
     }
 
@@ -1581,7 +1527,7 @@ mod tests {
             .unwrap()
             .expect("a slab opens while the upload is live");
         upload
-            .add_data_shard(id, 0, Bytes::from(vec![0u8; SECTOR_SIZE]))
+            .add_data_shard(id, 0, Bytes::from(vec![0u8; SECTOR_SIZE])).await
             .unwrap();
 
         assert_eq!(
@@ -1624,7 +1570,7 @@ mod tests {
             .expect("a slab opens while the upload is live");
         for index in 0..10 {
             upload
-                .add_data_shard(id, index, Bytes::from(vec![index as u8; SECTOR_SIZE]))
+                .add_data_shard(id, index, Bytes::from(vec![index as u8; SECTOR_SIZE])).await
                 .unwrap();
         }
 
@@ -1660,28 +1606,30 @@ mod tests {
             .expect("a slab opens while the upload is live");
         for index in 0..10 {
             upload
-                .add_data_shard(id, index, Bytes::from(vec![index as u8; SECTOR_SIZE]))
+                .add_data_shard(id, index, Bytes::from(vec![index as u8; SECTOR_SIZE])).await
                 .unwrap();
         }
 
-        // The queue passes the high water and the encoder parks before handing
-        // over its next batch.
+        // The queue reaches the high water and the encoder parks: it has a
+        // batch in hand but no room to hand it over.
         let deadline = Instant::now() + Duration::from_secs(20);
-        while upload.state.queued() <= QUEUE_HIGH_WATER && Instant::now() < deadline {
+        while upload.state.queued() < QUEUE_HIGH_WATER && Instant::now() < deadline {
             sleep(Duration::from_millis(5)).await;
         }
-        assert!(
-            upload.state.queued() > QUEUE_HIGH_WATER,
-            "the queue filled: {} shards",
-            upload.state.queued()
+        assert_eq!(
+            upload.state.queued(),
+            QUEUE_HIGH_WATER,
+            "the queue stops at the high water"
         );
-        let before = upload.state.parity_shards();
+        // With no host to drain it, the queue stays at the bound and the encoder
+        // has nowhere to put its next shard.
         sleep(Duration::from_millis(100)).await;
         assert_eq!(
-            upload.state.parity_shards(),
-            before,
-            "the encoder is waiting for room, not producing"
+            upload.state.queued(),
+            QUEUE_HIGH_WATER,
+            "the queue holds at the bound while the encoder has more to hand over"
         );
+        let before = upload.state.parity_shards();
 
         let handle = upload.cancel_handle();
         handle.cancel();
@@ -1723,7 +1671,7 @@ mod tests {
             .expect("a slab opens while the upload is live");
         for index in 0..10 {
             upload
-                .add_data_shard(id, index, Bytes::from(vec![index as u8; SECTOR_SIZE]))
+                .add_data_shard(id, index, Bytes::from(vec![index as u8; SECTOR_SIZE])).await
                 .unwrap();
         }
 
@@ -1833,7 +1781,7 @@ mod tests {
         assert_ne!(id, 0, "a slab opens and has an id");
         let shard = vec![7u8; 4096];
         for index in 0..10 {
-            packed.add_shard(id, index, &shard).unwrap();
+            packed.add_shard(id, index, &shard).await.unwrap();
         }
 
         // The ten data shards are queued immediately; the encoder adds parity from

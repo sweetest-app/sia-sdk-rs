@@ -43,10 +43,19 @@ impl RequestQueue {
         id
     }
 
-    /// Queues one produced shard for a slab opened with
-    /// [`open_slab`](Self::open_slab). Returns false when the shard does not
-    /// belong to the slab or was already produced.
-    pub(crate) fn add_shard(&mut self, id: SlabId, index: usize, data: Bytes) -> bool {
+    /// Queues one shard if the queue is below `limit`, atomically: the check and
+    /// the push happen under one lock, so two producers cannot both see room for
+    /// one shard. Returns false when there is no room, and the caller retries.
+    pub(crate) fn add_shard_if_room(
+        &mut self,
+        id: SlabId,
+        index: usize,
+        data: Bytes,
+        limit: usize,
+    ) -> bool {
+        if self.pending.len() >= limit {
+            return false;
+        }
         let Some(slab) = self.slabs.get_mut(&id) else {
             return false;
         };
@@ -200,7 +209,7 @@ mod tests {
         header.min_shards = count as u8;
         let id = queue.open_slab(header, count);
         for (index, shard) in shards(count).into_iter().enumerate() {
-            assert!(queue.add_shard(id, index, shard));
+            assert!(queue.add_shard_if_room(id, index, shard, usize::MAX));
         }
         id
     }

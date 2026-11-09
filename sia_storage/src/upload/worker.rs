@@ -147,11 +147,35 @@ impl WorkerState {
         if self.is_closed() {
             return false;
         }
-        let queued = self.queue.lock().unwrap().add_shard(id, index, data.clone());
+        let queued = self
+            .queue
+            .lock()
+            .unwrap()
+            .add_shard_if_room(id, index, data.clone(), super::QUEUE_HIGH_WATER);
         if queued {
             self.held_add(data.len());
         }
         queued
+    }
+
+    /// Queues one shard, waiting for room rather than dropping it. The queue
+    /// never holds more than `QUEUE_HIGH_WATER` shards, so the wait is what makes
+    /// that a bound instead of a hint.
+    pub(crate) async fn add_shard_waiting(
+        &self,
+        id: SlabId,
+        index: usize,
+        data: bytes::Bytes,
+    ) -> bool {
+        loop {
+            if self.is_closed() {
+                return false;
+            }
+            if self.add_shard(id, index, data.clone()) {
+                return true;
+            }
+            crate::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     /// Counts one parity shard handed to the queue.
