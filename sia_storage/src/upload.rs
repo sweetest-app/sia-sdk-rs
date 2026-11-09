@@ -8,7 +8,7 @@ use crate::app_client::{self, SlabPinParams};
 use crate::congestion::{InflightController, SamplePermit};
 use crate::encryption::{EncryptionKey, encrypt_shard};
 use crate::schedule::SlabId;
-use crate::erasure_coding::{self, ErasureCoder, SlabReader};
+use crate::erasure_coding::{self, ErasureCoder, SlabData, SlabReader};
 use crate::hosts::{QueueError, RPCError};
 #[cfg(test)]
 use crate::slabs::SlabVersion;
@@ -562,6 +562,28 @@ impl Upload {
             .unwrap_or(0)
     }
 
+    /// Reads up to one slab's worth of data. Returns the bytes consumed and,
+    /// when the slab filled, its ten data shards. Waiting for queue room happens
+    /// before the read, so nothing is read that cannot be handed on.
+    ///
+    /// This is the one source of data shards: both `read` and the packed
+    /// upload's `add` feed their shards through it.
+    pub(crate) async fn next_slab<R: AsyncRead + Unpin>(
+        &mut self,
+        data_key: EncryptionKey,
+        reader: &mut R,
+    ) -> Result<(usize, Option<SlabData>), UploadError> {
+        if !self.wait_for_room().await? {
+            return Ok((0, None));
+        }
+        Ok(self
+            .slab_buffer
+            .as_mut()
+            .unwrap()
+            .read_shards(data_key, reader)
+            .await?)
+    }
+
     /// Reads from the provided reader, buffering data into slabs and spawning
     /// slab-upload tasks as they fill. Returns the number of bytes read.
     pub(crate) async fn read<R: AsyncRead + Unpin>(
@@ -573,19 +595,7 @@ impl Upload {
         self.ensure_hosts().await?;
         let mut total_length: u64 = 0;
         loop {
-            // Room is checked before the disk is touched. Checking after the
-            // read meant a slab was always read and then held while the queue
-            // it could not join drained: one whole slab of memory past the
-            // high-water mark.
-            if !self.wait_for_room().await? {
-                return Ok(total_length);
-            }
-            let (n, slab) = self
-                .slab_buffer
-                .as_mut()
-                .unwrap()
-                .read_shards(data_key.clone(), &mut reader)
-                .await?;
+            let (n, slab) = self.next_slab(data_key.clone(), &mut reader).await?;
             if n == 0 {
                 return Ok(total_length);
             }
@@ -825,14 +835,37 @@ impl PackedUpload {
     /// no object references them. Whole buffers committed before the error
     /// stay in the slab as padding, counted in [length](Self::length) and
     /// [remaining](Self::remaining).
-    pub async fn add<R: AsyncRead + Unpin>(&mut self, r: R) -> Result<u64, UploadError> {
+    pub async fn add<R: AsyncRead + Unpin>(&mut self, mut r: R) -> Result<u64, UploadError> {
         let mut object = Object::new(None);
         object.data_key = self.data_key.clone();
         let start = self.upload.length();
-        let n = self.upload.read(object.data_key.clone(), r).await?;
+        let key = self.data_key.clone();
+        let mut read = 0usize;
+
+        // A thin caller of the per-shard calls: read a slab, register it, then
+        // hand over its ten data shards. Nothing here knows how a shard is
+        // encoded or queued.
+        loop {
+            let (n, slab) = self.upload.next_slab(key.clone(), &mut r).await?;
+            if n == 0 {
+                break;
+            }
+            read += n;
+            let Some(slab) = slab else { continue };
+            let id = self
+                .register_slab_with(slab.encryption_key, slab.length as u64)
+                .await?;
+            if id == 0 {
+                break;
+            }
+            for (index, shard) in slab.shards.iter().enumerate() {
+                self.add_shard(id, index, shard)?;
+            }
+        }
+
         let end = self.upload.length();
         self.objects.push(ObjectUpload { start, end, object });
-        Ok(n)
+        Ok(read as u64)
     }
 
     /// Adds a new object to the upload by opening the file at `path` and
@@ -882,12 +915,18 @@ impl PackedUpload {
     /// [`add_shard`](Self::add_shard); the encoder produces the parity shards
     /// from them, so nothing here needs a whole encoded slab.
     pub async fn register_slab(&mut self, length: u64) -> Result<u64, UploadError> {
+        self.register_slab_with(self.data_key.clone(), length).await
+    }
+
+    /// Same registration with the slab's own key, which is what the reader used
+    /// to encrypt the object stream for that slab.
+    async fn register_slab_with(
+        &mut self,
+        key: EncryptionKey,
+        length: u64,
+    ) -> Result<u64, UploadError> {
         Ok(
-            match self
-                .upload
-                .open_data_slab(self.data_key.clone(), length as usize)
-                .await?
-            {
+            match self.upload.open_data_slab(key, length as usize).await? {
                 Some(id) => id.0,
                 None => 0,
             },
