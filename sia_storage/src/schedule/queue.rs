@@ -135,7 +135,7 @@ impl RequestQueue {
     pub(crate) fn slab_ready_for_parity(&self, id: SlabId) -> bool {
         self.slabs
             .get(&id)
-            .is_some_and(|slab| slab.all_data_shards_ready())
+            .is_some_and(|slab| slab.ready_for_parity())
     }
 
     pub(crate) fn pending(&self) -> usize {

@@ -125,6 +125,20 @@ export declare class PackedUpload {
   /** Returns the optimal size of each slab in bytes. */
   optimalDataSize(): bigint
   /**
+   * Opens a slab for shards that arrive one at a time, and returns its id.
+   * Zero means the upload was cancelled.
+   */
+  registerSlab(length: bigint): Promise<bigint>
+  /** Queues one data shard of a slab opened with `registerSlab`. */
+  addShard(slab: bigint, index: number, data: Buffer): Promise<void>
+  /**
+   * Shard bytes the upload holds right now: queued shards, the shards a host
+   * is writing, parity being encoded, and the reader's buffer.
+   */
+  heldBytes(): Promise<bigint>
+  /** The highest `heldBytes` reached. */
+  peakHeldBytes(): Promise<bigint>
+  /**
    * Adds a new object to the upload. The data is read until EOF and packed into
    * the current slab. Returns the number of bytes consumed; call
    * [finalize](Self::finalize) once all objects have been added to get the

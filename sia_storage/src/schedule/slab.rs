@@ -86,8 +86,8 @@ impl SlabTracker {
     }
 
     /// Every data shard is in, so parity may be produced.
-    pub(crate) fn all_data_shards_ready(&self) -> bool {
-        self.slab.all_data_shards_ready()
+    pub(crate) fn ready_for_parity(&self) -> bool {
+        self.slab.ready_for_parity()
     }
 
     /// Abandons the slab whatever state it is in. A pinned slab refuses,
@@ -248,10 +248,10 @@ mod tests {
         let mut slab = SlabTracker::open(SlabId(1), seed(), 30);
         for index in 0..9 {
             assert!(slab.add_shard(index, Bytes::from(vec![index as u8; 8])));
-            assert!(!slab.all_data_shards_ready(), "nine of ten is not data");
+            assert!(!slab.ready_for_parity(), "nine of ten is not data");
         }
         assert!(slab.add_shard(9, Bytes::from(vec![9u8; 8])));
-        assert!(slab.all_data_shards_ready(), "ten of ten is ready");
+        assert!(slab.ready_for_parity(), "ten of ten is ready");
         assert!(
             slab.record(9, key(1), sector(key(1))),
             "a shard that exists is placed without waiting for parity"

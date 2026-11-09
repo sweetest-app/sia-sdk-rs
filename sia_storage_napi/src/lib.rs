@@ -8,7 +8,6 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_stream::StreamExt;
-use tokio_util::sync::CancellationToken;
 
 mod builder;
 mod io;
@@ -740,7 +739,7 @@ impl PinnedObject {
 #[napi]
 pub struct PackedUpload {
     inner: Arc<tokio::sync::Mutex<Option<sia_storage::PackedUpload>>>,
-    cancel: CancellationToken,
+    cancel: sia_storage::CancelHandle,
     optimal_data_size: u64,
     length: Arc<AtomicU64>,
 }
@@ -751,8 +750,10 @@ impl PackedUpload {
     /// packed size. Adding objects larger than this will start a new slab.
     #[napi]
     pub fn remaining(&self) -> BigInt {
-        let length = self.length.load(Ordering::Acquire);
-        BigInt::from(self.optimal_data_size - (length % self.optimal_data_size))
+        BigInt::from(remaining_of(
+            self.length.load(Ordering::Acquire),
+            self.optimal_data_size,
+        ))
     }
 
     /// Returns the number of bytes added so far.
@@ -777,6 +778,51 @@ impl PackedUpload {
         BigInt::from(self.optimal_data_size)
     }
 
+    /// Opens a slab for shards that arrive one at a time, and returns its id.
+    /// Zero means the upload was cancelled.
+    #[napi]
+    pub async fn register_slab(&self, length: BigInt) -> Result<BigInt> {
+        let mut guard = self.inner.lock().await;
+        let mut pu = guard.take().ok_or_else(|| Error::from_reason("upload closed"))?;
+        let (_, length, _) = length.get_u64();
+        let result: Result<u64> = pu
+            .register_slab(length)
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()));
+        *guard = Some(pu);
+        Ok(BigInt::from(result?))
+    }
+
+    /// Queues one data shard of a slab opened with `registerSlab`.
+    #[napi]
+    pub async fn add_shard(&self, slab: BigInt, index: u32, data: Buffer) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let mut pu = guard.take().ok_or_else(|| Error::from_reason("upload closed"))?;
+        let (_, slab, _) = slab.get_u64();
+        let result = pu
+            .add_shard(slab, index as usize, &data)
+            .map_err(|e| Error::from_reason(e.to_string()));
+        *guard = Some(pu);
+        result
+    }
+
+    /// Shard bytes the upload holds right now: queued shards, the shards a host
+    /// is writing, parity being encoded, and the reader's buffer.
+    #[napi]
+    pub async fn held_bytes(&self) -> Result<BigInt> {
+        let guard = self.inner.lock().await;
+        let pu = guard.as_ref().ok_or_else(|| Error::from_reason("upload closed"))?;
+        Ok(BigInt::from(pu.held_bytes() as u64))
+    }
+
+    /// The highest `heldBytes` reached.
+    #[napi]
+    pub async fn peak_held_bytes(&self) -> Result<BigInt> {
+        let guard = self.inner.lock().await;
+        let pu = guard.as_ref().ok_or_else(|| Error::from_reason("upload closed"))?;
+        Ok(BigInt::from(pu.peak_held_bytes() as u64))
+    }
+
     /// Adds a new object to the upload. The data is read until EOF and packed into
     /// the current slab. Returns the number of bytes consumed; call
     /// [finalize](Self::finalize) once all objects have been added to get the
@@ -799,25 +845,15 @@ impl PackedUpload {
         if self.cancel.is_cancelled() {
             return Err(Error::from_reason("upload closed"));
         }
-        let inner = self.inner.clone();
-        let cancel = self.cancel.clone();
-        let length = self.length.clone();
-        let result: Result<u64> = tokio::select! {
-            _ = cancel.cancelled() => Err(Error::from_reason("upload closed")),
-            r = async {
-                let mut guard = inner.lock().await;
-                // Take ownership so cancel's drop-cascade can abort in-flight
-                // slab uploads (they're held as AbortOnDropHandles inside pu).
-                let mut pu = guard.take().ok_or_else(|| Error::from_reason("upload closed"))?;
-                let res = pu.add(stream.0).await.map_err(|e| Error::from_reason(e.to_string()));
-                let total = pu.length();
-                *guard = Some(pu);
-                length.store(total, Ordering::Release);
-                res
-            } => r,
-        };
-        let size = result?;
-        Ok(BigInt::from(size))
+        let mut guard = self.inner.lock().await;
+        let mut pu = guard.take().ok_or_else(|| Error::from_reason("upload closed"))?;
+        let res = pu
+            .add(stream.0)
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()));
+        self.length.store(pu.length(), Ordering::Release);
+        *guard = Some(pu);
+        Ok(BigInt::from(res?))
     }
 
     /// Adds a new object to the upload by opening the file at `path`. Behaves
@@ -836,34 +872,23 @@ impl PackedUpload {
         if self.cancel.is_cancelled() {
             return Err(Error::from_reason("upload closed"));
         }
-        let inner = self.inner.clone();
-        let cancel = self.cancel.clone();
-        let length = self.length.clone();
-        let result: Result<u64> = tokio::select! {
-            _ = cancel.cancelled() => Err(Error::from_reason("upload closed")),
-            r = async {
-                let mut guard = inner.lock().await;
-                // Take ownership so cancel's drop-cascade can abort in-flight
-                // slab uploads (they're held as AbortOnDropHandles inside pu).
-                let mut pu = guard.take().ok_or_else(|| Error::from_reason("upload closed"))?;
-                let res = pu.add_path(path).await.map_err(|e| Error::from_reason(e.to_string()));
-                let total = pu.length();
-                *guard = Some(pu);
-                length.store(total, Ordering::Release);
-                res
-            } => r,
-        };
-        let size = result?;
-        Ok(BigInt::from(size))
+        let mut guard = self.inner.lock().await;
+        let mut pu = guard.take().ok_or_else(|| Error::from_reason("upload closed"))?;
+        let res = pu
+            .add_path(path)
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()));
+        self.length.store(pu.length(), Ordering::Release);
+        *guard = Some(pu);
+        Ok(BigInt::from(res?))
     }
 
     /// Cancels the upload.
     #[napi]
     pub fn cancel(&self) {
+        // The one signal: the core's closed flag. Every task of the upload
+        // observes it, and the queue drops the shards with it.
         self.cancel.cancel();
-        // If no add/finalize is holding the lock, drop pu here to abort any
-        // background slab uploads. If one is holding it, its select! will
-        // drop pu when it observes the cancel token.
         if let Ok(mut guard) = self.inner.try_lock() {
             guard.take();
         }
@@ -876,17 +901,13 @@ impl PackedUpload {
         if self.cancel.is_cancelled() {
             return Err(Error::from_reason("upload closed"));
         }
-        let inner = self.inner.clone();
-        let cancel = self.cancel.clone();
-        let objects: Result<Vec<sia_storage::Object>> = tokio::select! {
-            _ = cancel.cancelled() => Err(Error::from_reason("upload closed")),
-            r = async {
-                let mut guard = inner.lock().await;
-                let pu = guard.take().ok_or_else(|| Error::from_reason("upload closed"))?;
-                pu.finalize().await.map_err(|e| Error::from_reason(e.to_string()))
-            } => r,
-        };
-        Ok(objects?
+        let mut guard = self.inner.lock().await;
+        let pu = guard.take().ok_or_else(|| Error::from_reason("upload closed"))?;
+        let objects = pu
+            .finalize()
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(objects
             .into_iter()
             .map(|o| PinnedObject {
                 inner: Mutex::new(o),
@@ -921,9 +942,10 @@ impl Sdk {
             .inner
             .upload_packed(options)
             .map_err(|e| Error::from_reason(e.to_string()))?;
+        let cancel = packed_upload.cancel_handle();
         Ok(PackedUpload {
             inner: Arc::new(tokio::sync::Mutex::new(Some(packed_upload))),
-            cancel: CancellationToken::new(),
+            cancel,
             optimal_data_size,
             length: Arc::new(AtomicU64::new(0)),
         })
@@ -1183,22 +1205,14 @@ pub fn encoded_size(size: BigInt, data_shards: u8, parity_shards: u8) -> Result<
     Ok(sia_storage::encoded_size(size, data_shards, parity_shards).into())
 }
 
+/// Bytes remaining in the current slab, given what has been added so far.
+fn remaining_of(length: u64, optimal_data_size: u64) -> u64 {
+    optimal_data_size - (length % optimal_data_size)
+}
+
 #[cfg(test)]
 mod packed_remaining_tests {
     use super::*;
-
-    fn upload(length: u64, optimal_data_size: u64) -> PackedUpload {
-        PackedUpload {
-            inner: Arc::new(tokio::sync::Mutex::new(None)),
-            cancel: CancellationToken::new(),
-            optimal_data_size,
-            length: Arc::new(AtomicU64::new(length)),
-        }
-    }
-
-    fn remaining(length: u64, optimal_data_size: u64) -> u64 {
-        upload(length, optimal_data_size).remaining().get_u64().1
-    }
 
     #[test]
     fn a_full_slab_reports_a_whole_slab_free() {

@@ -110,10 +110,15 @@ impl Slab {
         Ok(())
     }
 
-    /// Every data shard is in, so parity may be produced. This is the encoder's
-    /// trigger and nothing else: placement does not wait for it.
-    pub(crate) fn all_data_shards_ready(&self) -> bool {
+    /// Every data shard is in, so parity may be produced.
+    pub(crate) fn data_complete(&self) -> bool {
         self.data_count == self.data.len()
+    }
+
+    /// The encoder's trigger. Named for what the encoder asks, so a reader of
+    /// the encoder cannot mistake it for a gate on shards.
+    pub(crate) fn ready_for_parity(&self) -> bool {
+        self.data_complete()
     }
 
     /// Records a shard that landed. Data and parity are recorded the same way;
@@ -227,21 +232,22 @@ mod tests {
     }
 
     #[test]
-    fn all_data_shards_ready_needs_every_one() {
+    fn data_complete_needs_every_data_shard() {
         let mut slab = open();
         for index in 0..9 {
             slab.add_data_shard(index, byte(index as u8)).unwrap();
-            assert!(!slab.all_data_shards_ready(), "{index} of ten is not all");
+            assert!(!slab.data_complete(), "{index} of ten is not all");
         }
         slab.add_data_shard(9, byte(9)).unwrap();
-        assert!(slab.all_data_shards_ready());
+        assert!(slab.data_complete());
+        assert!(slab.ready_for_parity(), "the encoder sees the same fact");
     }
 
     #[test]
     fn a_shard_is_placed_before_the_data_is_complete() {
         let mut slab = open();
         slab.add_data_shard(0, byte(0)).unwrap();
-        assert!(!slab.all_data_shards_ready(), "nine data shards are missing");
+        assert!(!slab.ready_for_parity(), "nine data shards are missing");
         slab.shard_placed(0).expect("a shard that exists can be placed");
         assert_eq!(slab.placed_count(), 1);
     }
@@ -296,6 +302,11 @@ mod tests {
         mid.cancel().unwrap();
         assert_eq!(mid.state(), SlabState::Abandoned, "from a placed shard");
 
+        let mut abandoned = open();
+        abandoned.cancel().unwrap();
+        abandoned.cancel().expect("cancelling twice is not an error");
+        assert_eq!(abandoned.state(), SlabState::Abandoned);
+
         let mut pinned = with_data();
         for index in 0..30 {
             pinned.shard_placed(index).unwrap();
@@ -306,6 +317,24 @@ mod tests {
             "a pinned slab is already paid for"
         );
         assert_eq!(pinned.state(), SlabState::Pinned);
+    }
+
+    #[test]
+    fn cancel_between_parity_shards_refuses_the_rest() {
+        // Parity arrives in batches while data shards are already placed, so a
+        // cancel lands part way through the slab rather than before it starts.
+        let mut slab = with_data();
+        for index in 0..15 {
+            slab.shard_placed(index).unwrap();
+        }
+        slab.cancel().unwrap();
+        assert_eq!(slab.state(), SlabState::Abandoned);
+        assert_eq!(
+            slab.shard_placed(15),
+            Err(SlabError::closed(SlabState::Abandoned)),
+            "the shard after the cancel is refused"
+        );
+        assert_eq!(slab.placed_count(), 15);
     }
 
     #[test]

@@ -1554,6 +1554,58 @@ mod tests {
         );
     }
 
+    /// Cancelling after parity has started leaves no shard queued and no
+    /// encoder running.
+    #[sia_core_derive::cross_target_test]
+    async fn test_cancel_after_the_first_parity_batch() {
+        use sia_core::rhp4::SECTOR_SIZE;
+
+        let hosts = Hosts::new(Client::from_mock(mock::Client::new()));
+        // No hosts to write to, so the queue keeps what the encoder produced
+        // and the test can see how far it got.
+        let mut upload = Upload::new(
+            hosts,
+            app_client::Client::mock(),
+            Arc::new(AppKey::import(rand::random())),
+            UploadOptions::default(),
+        )
+        .unwrap();
+        let id = upload
+            .open_data_slab(EncryptionKey::from([3u8; 32]), SECTOR_SIZE)
+            .await
+            .unwrap()
+            .expect("a slab opens while the upload is live");
+        for index in 0..10 {
+            upload
+                .add_data_shard(id, index, Bytes::from(vec![index as u8; SECTOR_SIZE]))
+                .unwrap();
+        }
+
+        // Wait until the first parity batch has joined the ten data shards.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while upload.state.queued() < 10 + PARITY_BATCH && Instant::now() < deadline {
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            upload.state.queued() >= 10 + PARITY_BATCH,
+            "parity started: {} shards queued",
+            upload.state.queued()
+        );
+
+        let handle = upload.cancel_handle();
+        handle.cancel();
+        assert!(handle.is_cancelled());
+        assert_eq!(
+            upload.state.queued(),
+            0,
+            "the shards of an abandoned slab are dropped"
+        );
+        assert!(
+            matches!(upload.finish().await, Err(UploadError::Cancelled)),
+            "a cancelled upload does not pin"
+        );
+    }
+
     /// A pinned slab is reported when the upload is cancelled, which is what a
     /// caller resumes from.
     #[sia_core_derive::cross_target_test]
