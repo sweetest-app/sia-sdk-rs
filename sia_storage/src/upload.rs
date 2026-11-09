@@ -344,6 +344,14 @@ struct HeldBytes {
 }
 
 impl HeldBytes {
+    /// Counts bytes that are already counted elsewhere.
+    fn adopt(state: &Arc<worker::WorkerState>, bytes: usize) -> Self {
+        Self {
+            state: state.clone(),
+            bytes,
+        }
+    }
+
     fn new(state: &Arc<worker::WorkerState>, bytes: usize) -> Self {
         state.held_add(bytes);
         Self {
@@ -397,9 +405,6 @@ impl Upload {
             options.shard_attempt.clone(),
         ));
         let slab_buffer = SlabReader::new(options.data_shards as usize);
-        // The reader's shards and landing buffer exist for the life of the
-        // upload, so they count as held memory even when nothing is queued.
-        state.held_add(slab_buffer.allocated_bytes());
         Ok(Self {
             client,
             app_key,
@@ -569,7 +574,9 @@ impl Upload {
                 // batches only split its output.
                 let inputs: Vec<Bytes> = open.plain.iter().flatten().cloned().collect();
                 let plain_bytes: usize = inputs.iter().map(Bytes::len).sum();
-                let mut plain_held = HeldBytes::new(&state, plain_bytes);
+                // Counted when the reader produced the slab; this takes over the
+                // count and releases it when the encoder is done.
+                let mut plain_held = HeldBytes::adopt(&state, plain_bytes);
                 for first in (data_shards..total).step_by(PARITY_BATCH) {
                     // Cancelled while encoding: stop before the next batch rather
                     // than finish work whose shards nobody will write.
@@ -639,12 +646,18 @@ impl Upload {
         if !self.wait_for_room().await? {
             return Ok((0, None));
         }
-        Ok(self
+        let (read, slab) = self
             .slab_buffer
             .as_mut()
             .unwrap()
             .read_shards(data_key, reader)
-            .await?)
+            .await?;
+        if let Some(slab) = &slab {
+            // The reader allocated this slab's buffers; they are held until the
+            // encoder that takes them finishes.
+            self.state.held_add(slab.bytes());
+        }
+        Ok((read, slab))
     }
 
     /// Reads from the provided reader, buffering data into slabs and spawning
@@ -679,6 +692,9 @@ impl Upload {
     /// for every registered slab to be pinned by a worker.
     pub(crate) async fn finish(mut self) -> Result<Vec<Slab>, UploadError> {
         let last_slab = self.slab_buffer.take().unwrap().finish();
+        if let Some(slab) = &last_slab {
+            self.state.held_add(slab.bytes());
+        }
         if let Some(slab) = last_slab {
             self.ensure_hosts().await?;
             if let Some(id) = self.open_data_slab(slab.encryption_key, slab.length).await? {
@@ -1565,12 +1581,23 @@ mod tests {
         )
         .unwrap();
 
-        let reader = upload.held_bytes();
-        assert!(
-            reader >= 10 * SECTOR_SIZE,
-            "the reader's ten data shards are held: {reader}"
+        // Nothing is held before a slab is read: the reader's buffers are
+        // counted when it allocates them for a slab.
+        assert_eq!(upload.held_bytes(), 0);
+        let size = upload.optimal_data_size();
+        let (_, slab) = upload
+            .next_slab(
+                EncryptionKey::from([3u8; 32]),
+                &mut Cursor::new(vec![0u8; size]),
+            )
+            .await
+            .unwrap();
+        assert!(slab.is_some(), "a full slab was read");
+        assert_eq!(
+            upload.held_bytes(),
+            10 * SECTOR_SIZE,
+            "the slab being read is held"
         );
-        assert_eq!(upload.peak_held_bytes(), reader);
 
         let id = upload
             .open_data_slab(EncryptionKey::from([3u8; 32]), SECTOR_SIZE)
@@ -1578,15 +1605,16 @@ mod tests {
             .unwrap()
             .expect("a slab opens while the upload is live");
         upload
-            .add_data_shard(id, 0, Bytes::from(vec![0u8; SECTOR_SIZE])).await
+            .add_data_shard(id, 0, Bytes::from(vec![0u8; SECTOR_SIZE]))
+            .await
             .unwrap();
 
         assert_eq!(
             upload.held_bytes(),
-            reader + SECTOR_SIZE,
-            "one queued shard of four mebibytes"
+            11 * SECTOR_SIZE,
+            "the read slab plus one queued shard"
         );
-        assert_eq!(upload.peak_held_bytes(), reader + SECTOR_SIZE);
+        assert_eq!(upload.peak_held_bytes(), 11 * SECTOR_SIZE);
 
         upload.state.shutdown();
         assert_eq!(upload.held_bytes(), 0, "a stopped upload holds nothing");
